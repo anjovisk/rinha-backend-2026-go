@@ -1,0 +1,33 @@
+# Binários compilados
+/server
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Artefatos de teste
+*.test
+*.out
+coverage.html
+
+# Go workspace
+go.work
+go.work.sum
+
+# Dependências vendorizadas
+vendor/
+
+# Variáveis de ambiente
+.env
+.env.*
+!.env.example
+
+# IDEs
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Sistema operacional
+.DS_Store
+Thumbs.db
