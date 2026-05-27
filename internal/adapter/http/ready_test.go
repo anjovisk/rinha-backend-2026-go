@@ -1,19 +1,21 @@
-package handler_test
+package httphandler_test
 
 import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
 
-	"github.com/anjovisk/fraud-detection/internal/handler"
+	"go.uber.org/zap"
+
+	httphandler "anjovisk/fraud-detection/internal/adapter/http"
 )
 
-// TestReady_returns200 verifica que o handler Ready responde com HTTP 200 OK.
-func TestReady_returns200(t *testing.T) {
+func TestHandleReady_returns200(t *testing.T) {
+	srv := httphandler.NewServer(nil, zap.NewNop())
 	req := httptest.NewRequest(http.MethodGet, "/ready", nil)
 	rec := httptest.NewRecorder()
 
-	handler.Ready(rec, req)
+	srv.Routes().ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusOK {
 		t.Errorf("expected status %d, got %d", http.StatusOK, rec.Code)

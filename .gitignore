@@ -1,5 +1,8 @@
 # Binários compilados
 /server
+
+# Artefato gerado pelo cmd/preprocess (gerado no build, não versionado)
+resources/references.bin
 *.exe
 *.dll
 *.so
