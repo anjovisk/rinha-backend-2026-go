@@ -19,10 +19,12 @@ import (
 	"log"
 	"math"
 	"os"
+	"strconv"
 
 	"go.uber.org/zap"
 
-	"anjovisk/fraud-detection/internal/adapter/ann"
+	"anjovisk/fraud-detection/internal/adapter/hnsw"
+	"anjovisk/fraud-detection/internal/adapter/ivf"
 	"anjovisk/fraud-detection/internal/domain"
 )
 
@@ -130,17 +132,23 @@ func main() {
 	} else {
 		log.Printf("skipping HNSW index build (BUILD_HNSW != true)")
 	}
+
+	if os.Getenv("BUILD_IVF") == "true" {
+		buildIVF(outPath)
+	} else {
+		log.Printf("skipping IVF-SQ8 index build (BUILD_IVF != true)")
+	}
 }
 
 // buildHNSW builds an HNSW approximate index from binPath and exports it to
 // resources/references.hnsw. This runs once at build/preprocess time so the
-// server can call ann.Load instead of rebuilding the index on every startup.
+// server can call hnsw.Load instead of rebuilding the index on every startup.
 func buildHNSW(binPath string, count uint32) {
 	const hnswPath = "resources/references.hnsw"
 
 	log.Printf("building HNSW index (%d entries)…", count)
 
-	s, err := ann.Open(binPath, zap.NewNop())
+	s, err := hnsw.Open(binPath, zap.NewNop())
 	if err != nil {
 		log.Fatalf("build HNSW index: %v", err)
 	}
@@ -151,6 +159,34 @@ func buildHNSW(binPath string, count uint32) {
 	}
 
 	log.Printf("done: HNSW index → %s", hnswPath)
+}
+
+// buildIVF constructs an IVF approximate index from binPath and exports it to
+// resources/references.ivf. Cluster count is read from IVF_NLIST (default 1024);
+// SQ8 quantization is read from IVF_SQ8 (default true).
+// This runs once at build/preprocess time so the server can call ivf.Open at startup.
+func buildIVF(binPath string) {
+	const ivfPath = "resources/references.ivf"
+
+	nlist := ivf.DefaultNlist
+	if raw := os.Getenv("IVF_NLIST"); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil && n > 0 {
+			nlist = n
+		}
+	}
+
+	sq8 := ivf.DefaultSQ8
+	if raw := os.Getenv("IVF_SQ8"); raw == "false" {
+		sq8 = false
+	}
+
+	log.Printf("building IVF index (nlist=%d, sq8=%v)…", nlist, sq8)
+
+	if err := ivf.Build(binPath, ivfPath, nlist, sq8, zap.NewNop()); err != nil {
+		log.Fatalf("build IVF index: %v", err)
+	}
+
+	log.Printf("done: IVF index → %s", ivfPath)
 }
 
 // isFiniteF32 reports whether f is neither NaN nor infinite.

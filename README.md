@@ -30,15 +30,15 @@ O Nginx atua como load balancer em round-robin. Nenhuma lógica de negócio é e
 └─────────────────┬──────────────────────────┬─────────────────┘
                   │ port.Vectorizer           │ port.NeighborFinder
                   ▼                           ▼
-┌──────────────────────┐       ┌──────────────────────────────┐
-│   adapter/vector     │       │  adapter/knn  (VECTOR_SEARCHER= │
-│   Vectorize()        │       │   brute)  ou  adapter/ann    │
-│   (14 dimensões)     │       │   (VECTOR_SEARCHER=hnsw)        │
-│   normalization.json │       │                              │
-│   mcc_risk.json      │       │   FindNearest() via          │
-│                      │       │   brute-force O(N) ou        │
-│                      │       │   HNSW aprox. O(log N)       │
-└──────────────────────┘       └──────────────────────────────┘
+┌──────────────────────┐       ┌──────────────────────────────────────┐
+│   adapter/vector     │       │  adapter/knn  (VECTOR_SEARCHER=brute)│
+│   Vectorize()        │       │  adapter/hnsw (VECTOR_SEARCHER=hnsw) │
+│   (14 dimensões)     │       │  adapter/ivf  (VECTOR_SEARCHER=ivf)  │
+│   normalization.json │       │                                      │
+│   mcc_risk.json      │       │  FindNearest() via brute O(N),       │
+│                      │       │  HNSW aprox. O(log N) ou             │
+│                      │       │  IVF-SQ8 aprox. O(nprobe·N/nlist)   │
+└──────────────────────┘       └──────────────────────────────────────┘
 ```
 
 As dependências fluem sempre para dentro: adapters conhecem ports, ports conhecem o domínio. O domínio não importa nenhum pacote interno.
@@ -53,7 +53,8 @@ As dependências fluem sempre para dentro: adapters conhecem ports, ports conhec
 | `internal/adapter/http` | Adapter primário | HTTP handlers, parsing de JSON, mapeamento para domínio |
 | `internal/adapter/vector` | Adapter secundário | Normaliza o payload em vetor de 14 dimensões |
 | `internal/adapter/knn` | Adapter secundário | Busca exata brute-force O(N) via mmap; selecionado por `VECTOR_SEARCHER=brute` (padrão) |
-| `internal/adapter/ann` | Adapter secundário | Busca aproximada HNSW O(log N) via `github.com/coder/hnsw`; selecionado por `VECTOR_SEARCHER=hnsw` |
+| `internal/adapter/hnsw` | Adapter secundário | Busca aproximada HNSW O(log N) via `github.com/coder/hnsw`; selecionado por `VECTOR_SEARCHER=hnsw` |
+| `internal/adapter/ivf` | Adapter secundário | Busca aproximada IVF-SQ8; K-means + quantização uint8; selecionado por `VECTOR_SEARCHER=ivf` |
 
 ## Stack
 
@@ -68,7 +69,7 @@ As dependências fluem sempre para dentro: adapters conhecem ports, ports conhec
 .
 ├── cmd/
 │   ├── preprocess/
-│   │   └── main.go                    # converte references.json.gz → references.bin + references.hnsw
+│   │   └── main.go                    # converte references.json.gz → references.bin + references.hnsw + references.ivf
 │   └── server/
 │       └── main.go                    # bootstrap: carrega recursos, conecta adapters → usecase → HTTP
 ├── internal/
@@ -91,19 +92,24 @@ As dependências fluem sempre para dentro: adapters conhecem ports, ports conhec
 │       │   └── vectorizer.go          # implementa Vectorizer
 │       ├── knn/
 │       │   └── searcher.go            # implementa NeighborFinder (brute-force exato, mmap)
-│       └── ann/
-│           └── hnsw.go                # implementa NeighborFinder (HNSW aproximado)
+│       ├── ann/
+│       │   └── hnsw.go                # implementa NeighborFinder (HNSW aproximado)
+│       └── ivf/
+│           ├── ivf.go                 # implementa NeighborFinder (IVF-SQ8 aproximado); Open e FindNearest
+│           ├── build.go               # K-means paralelo, quantização SQ8, Build e New
+│           └── ivf_test.go
 ├── resources/
 │   ├── references.json.gz             # fonte original: 3M vetores rotulados (não lida em runtime)
 │   ├── references.bin                 # gerado por cmd/preprocess; lido via mmap em runtime
 │   ├── references.hnsw                # gerado por cmd/preprocess quando BUILD_HNSW=true; grafo HNSW serializado
+│   ├── references.ivf                 # gerado por cmd/preprocess quando BUILD_IVF=true; índice IVF-SQ8 (~45 MB)
 │   ├── mcc_risk.json                  # risco por categoria de merchant (MCC)
 │   └── normalization.json             # constantes de normalização
 ├── docs/                              # documentação em português
 ├── go.mod
-├── .env                               # padrão local: VECTOR_SEARCHER=brute, BUILD_HNSW=false (não versionado)
+├── .env                               # padrão local: VECTOR_SEARCHER, BUILD_HNSW, BUILD_IVF, IVF_NLIST, IVF_NPROBE
 ├── .env.example                       # template comentado de todas as variáveis
-├── Dockerfile                         # build multi-stage; ARG BUILD_HNSW controla geração do índice HNSW
+├── Dockerfile                         # build multi-stage; ARGs BUILD_HNSW e BUILD_IVF controlam geração dos índices
 ├── nginx.conf                         # configuração do load balancer
 └── docker-compose.yml                 # nginx (:9999) + api-1 (:8080) + api-2 (:8081); lê .env
 ```
@@ -172,14 +178,24 @@ go run ./cmd/preprocess
 
 # references.bin + references.hnsw (necessário para VECTOR_SEARCHER=hnsw com startup rápido)
 BUILD_HNSW=true go run ./cmd/preprocess
+
+# IVF com SQ8 (padrão, ~45 MB) — necessário para VECTOR_SEARCHER=ivf
+BUILD_IVF=true go run ./cmd/preprocess
+
+# IVF sem SQ8 (~168 MB, distâncias exatas dentro de cada cluster)
+BUILD_IVF=true IVF_SQ8=false go run ./cmd/preprocess
+
+# IVF com mais clusters (melhor recall, build mais lento)
+BUILD_IVF=true IVF_NLIST=2048 go run ./cmd/preprocess
 ```
 
-O preprocess produz até dois arquivos:
+O preprocess produz até três arquivos:
 
 | Arquivo | Quando gerado | O que é | Usado por |
 |---------|--------------|---------|-----------|
 | `references.bin` | Sempre | Binário flat SoA: `[uint32 N][N×56 B float32][N×1 B uint8]` | Todos os modos — lido via mmap em runtime |
-| `references.hnsw` | `BUILD_HNSW=true` | Grafo HNSW serializado pelo `coder/hnsw` | `VECTOR_SEARCHER=hnsw` com `ann.Load` — startup rápido |
+| `references.hnsw` | `BUILD_HNSW=true` | Grafo HNSW serializado pelo `coder/hnsw` | `VECTOR_SEARCHER=hnsw` com `hnsw.Load` — startup rápido |
+| `references.ivf` | `BUILD_IVF=true` | Índice IVF: byte de flags + centroides + vetores (uint8 ou float32) + labels | `VECTOR_SEARCHER=ivf` — obrigatório, Fatal se ausente |
 
 **Por que o binário?**
 
@@ -201,12 +217,62 @@ O algoritmo usado para encontrar os 5 vizinhos mais próximos é controlado pela
 | `brute` (padrão) | Brute-force exato | O(N) | < 1 s (mmap) | 0 — vetores compartilhados via page cache | 100% |
 | `hnsw` + `references.hnsw` presente | HNSW aprox. (`coder/hnsw`, M=4, EfSearch=50) — **Load** | O(log N) | < 1 s (import) | ~170 MB heap (vetores alocados pelo Import) | ~93–97% |
 | `hnsw` + `references.hnsw` ausente | HNSW aprox. — **Open** (build from scratch) | O(log N) | dezenas de segundos (O(N log N)) | ~50–100 MB heap (conexões apenas; vetores no mmap) | ~93–97% |
+| `ivf` + `IVF_SQ8=true` (padrão) | IVF aprox. com SQ8 (K-means + uint8) | O(nprobe·N/nlist) | < 1 s (leitura heap) | ~45 MB heap por instância | ~95–99% (nprobe=32) |
+| `ivf` + `IVF_SQ8=false` | IVF aprox. sem SQ8 (K-means + float32) | O(nprobe·N/nlist) | < 1 s (leitura heap) | ~168 MB heap por instância | ~96–99% (nprobe=32) |
 
 Quando `VECTOR_SEARCHER=hnsw`, o servidor detecta automaticamente se `resources/references.hnsw` existe:
-- **Arquivo presente** (`cmd/preprocess` foi executado): usa `ann.Load` — carrega o grafo serializado em O(N), sem custo de build. Vetores ficam em heap (~170 MB por instância).
-- **Arquivo ausente**: usa `ann.Open` — constrói o grafo em O(N log N), mais lento para iniciar, mas vetores ficam no mmap (~0 MB heap extra). Um `Warn` é emitido no log.
+- **Arquivo presente** (`cmd/preprocess` foi executado): usa `hnsw.Load` — carrega o grafo serializado em O(N), sem custo de build. Vetores ficam em heap (~170 MB por instância).
+- **Arquivo ausente**: usa `hnsw.Open` — constrói o grafo em O(N log N), mais lento para iniciar, mas vetores ficam no mmap (~0 MB heap extra). Um `Warn` é emitido no log.
 
-> **Budget de memória:** com `hnsw` + `Load`, cada instância usa ~170 MB de heap adicional para os vetores. Com duas instâncias, isso soma ~340 MB só para vetores — deixando pouca margem no budget de 350 MB. Use `hnsw` + `Open` se a memória for crítica, ou `hnsw` + `Load` em ambientes com mais RAM.
+Quando `VECTOR_SEARCHER=ivf`, o arquivo `resources/references.ivf` é obrigatório (Fatal se ausente). A busca:
+1. Encontra os `nprobe` clusters mais próximos por L2 entre os `nlist` centroides.
+2. Percorre os vetores dentro desses clusters: distância SQ8-aproximada (uint8) ou exata (float32), conforme o flag gravado no arquivo.
+3. Retorna os k vizinhos mais próximos encontrados.
+
+`IVF_NPROBE` (padrão 32) e `IVF_NLIST` (padrão 1024, build-time) controlam o tradeoff recall/latência:
+- `nprobe=32` / `nlist=1024` → busca ~3% do dataset, ~30× mais rápido que brute-force.
+- `nprobe=64` → ~6%, melhor recall com latência 2× maior.
+
+`IVF_SQ8` (padrão `true`, build-time) controla a precisão e o uso de memória:
+- `IVF_SQ8=true` → float32 comprimido para uint8 por dimensão: **~45 MB** por instância, pequena perda de precisão nas distâncias.
+- `IVF_SQ8=false` → vetores mantidos como float32: **~168 MB** por instância, distâncias exatas dentro de cada cluster (o erro residual vem apenas da partição K-means).
+
+O flag SQ8 é gravado no cabeçalho de `references.ivf` (byte de flags, bit 0); o servidor o lê automaticamente ao carregar o arquivo — **nenhuma variável de ambiente é necessária em runtime**.
+
+> **Budget de memória:** com `IVF_SQ8=true`, cada instância usa ~45 MB de heap (vs ~170 MB do `hnsw` + Load). Com `IVF_SQ8=false`, o consumo sobe para ~168 MB por instância — comparável ao HNSW com Load, mas sem o custo de build no startup.
+
+#### Ranqueamento de configurações IVF
+
+A memória do índice depende de `IVF_SQ8`: **~45 MB com SQ8** (padrão) ou **~168 MB sem SQ8**. O tradeoff principal continua sendo latência de busca vs recall, controlado por `IVF_NLIST` e `IVF_NPROBE`. A tabela abaixo assume `IVF_SQ8=true` (SQ8 ativo). A tabela abaixo mostra as configurações mais relevantes para a base de N = 3.000.000 vetores com D = 14 dimensões.
+
+| # | `IVF_NLIST` | `IVF_NPROBE` | Vetores/query | % do dataset | Speedup vs brute | Recall k=5 (est.) | Build K-means |
+|---|-------------|--------------|:-------------:|:------------:|:----------------:|:-----------------:|:-------------:|
+| 1 | 2048 | 16 | 23.437 | 0,78% | ~128× | ~76% | ~60 s |
+| 2 | 1024 | 16 | 46.875 | 1,56% | ~64× | ~81% | ~30 s |
+| 3 | 2048 | 32 | 46.875 | 1,56% | ~64× | ~86% | ~60 s |
+| 4 | 1024 | 32 | 93.750 | 3,13% | ~32× | ~90% | ~30 s |
+| **5 ★** | **2048** | **64** | **93.750** | **3,13%** | **~32×** | **~94%** | **~60 s** |
+| 6 | 1024 | 64 | 187.500 | 6,25% | ~16× | ~96% | ~30 s |
+| 7 | 2048 | 128 | 187.500 | 6,25% | ~16× | ~98% | ~60 s |
+| 8 | 4096 | 128 | 93.750 | 3,13% | ~32× | ~97% | ~120 s |
+
+**Recall**: fração estimada das queries em que o conjunto exato de top-5 vizinhos é recuperado. Para o mesmo percentual de dataset pesquisado, `nlist` maior produz particionamento mais fino e recall ligeiramente maior (configs #5 vs #4, e #8 vs #7). Valores dependem da distribuição real dos dados — valide com benchmark local antes de escolher a config final.
+
+**Build K-means**: estimativa para 8 CPUs com convergência antes de 30 iterações; em hardware de build com mais núcleos o tempo cai proporcionalmente.
+
+**Análise por critério da competição:**
+
+| Critério | Config | Justificativa |
+|----------|--------|---------------|
+| Menor latência | #1 nlist=2048 / nprobe=16 | ~128× vs brute; pesquisa 23K vetores por query |
+| Melhor recall | #7 nlist=2048 / nprobe=128 | ~98%; FN têm peso 3 — perder fraudes custa mais que falsos alarmes |
+| Menor uso de CPU por query | #1 nlist=2048 / nprobe=16 | Libera mais headroom para requests concorrentes |
+| **Melhor balanço geral ★** | **#5 nlist=2048 / nprobe=64** | **~32× speedup + ~94% recall; seguro contra o corte de detecção** |
+| Build mais rápido | #2–#4 nlist=1024 | Metade do tempo de K-means vs nlist=2048 |
+
+> **Corte de detecção:** erros de detecção (FP + FN + HTTP 5xx) acima de 15% zeram a `detection_score`. Com recall ~94%, aproximadamente 6% das queries retornam um top-5 diferente do exato — mas como `fraud_score` é discreto em passos de 0,2 (inteiros/5), a maioria dessas divergências não altera a decisão final. Configurações com recall abaixo de ~88% (configs #1 e #2) elevam o risco de cruzar o limiar, especialmente em transações borderline com score próximo de 0,6.
+
+> **Latência**: mesmo a config #7 (187.500 vetores × 14 uint8 ops) opera com folga abaixo de 1 ms — a busca não é o gargalo. O que diferencia as configs na prática é a pressão de CPU sob carga concorrente, não a latência por query individual.
 
 ### Rodar a aplicação
 
@@ -228,8 +294,12 @@ VECTOR_SEARCHER=hnsw ./server
 |----------|--------|--------|-----------|
 | `PORT` | `8080` | Runtime | Porta de escuta da instância |
 | `LOG_LEVEL` | `info` | Runtime | Nível mínimo de log (`debug`, `info`, `warn`, `error`) |
-| `VECTOR_SEARCHER` | `brute` | Runtime | Backend de busca vetorial (`brute` ou `hnsw`) |
+| `VECTOR_SEARCHER` | `brute` | Runtime | Backend de busca vetorial (`brute`, `hnsw` ou `ivf`) |
+| `IVF_NPROBE` | `32` | Runtime | Clusters pesquisados por query com `VECTOR_SEARCHER=ivf`; maior = mais recall e mais lento |
 | `BUILD_HNSW` | `false` | Build time | Quando `true`, `cmd/preprocess` gera `references.hnsw`; passado como `ARG` ao Dockerfile |
+| `BUILD_IVF` | `false` | Build time | Quando `true`, `cmd/preprocess` gera `references.ivf`; passado como `ARG` ao Dockerfile |
+| `IVF_NLIST` | `1024` | Build time | Número de clusters K-means para o índice IVF; passado como `ARG` ao Dockerfile |
+| `IVF_SQ8` | `true` | Build time | `true` = uint8 por dim (~45 MB); `false` = float32 por dim (~168 MB); gravado no arquivo, lido automaticamente em runtime |
 
 ### Logs
 
@@ -260,15 +330,21 @@ O `docker-compose.yml` lê as variáveis do arquivo `.env` na raiz do projeto. A
 
 | Variável | Tipo | Descrição |
 |----------|------|-----------|
-| `VECTOR_SEARCHER` | Runtime env | Backend de busca (`brute` ou `hnsw`); injetado em cada instância de API |
+| `VECTOR_SEARCHER` | Runtime env | Backend de busca (`brute`, `hnsw` ou `ivf`); injetado em cada instância de API |
+| `IVF_NPROBE` | Runtime env | Clusters pesquisados por query com `ivf` (padrão 32); injetado em cada instância |
 | `BUILD_HNSW` | Build arg (`ARG`) | Quando `true`, `cmd/preprocess` gera `references.hnsw` durante o `docker build` |
+| `BUILD_IVF` | Build arg (`ARG`) | Quando `true`, `cmd/preprocess` gera `references.ivf` durante o `docker build` |
+| `IVF_NLIST` | Build arg (`ARG`) | Clusters K-means para o índice IVF (padrão 1024) |
+| `IVF_SQ8` | Build arg (`ARG`) | `true` (padrão) = SQ8 ativo (~45 MB/instância); `false` = float32 (~168 MB/instância) |
 
 Para trocar o backend ou habilitar o pré-build, edite o `.env`:
 
 ```bash
-# .env
-VECTOR_SEARCHER=hnsw
-BUILD_HNSW=true   # gera references.hnsw no build — necessário para startup rápido com hnsw
+# .env — IVF-SQ8 com 1024 clusters, 32 probes por query
+VECTOR_SEARCHER=ivf
+BUILD_IVF=true
+IVF_NLIST=1024
+IVF_NPROBE=32
 ```
 
 Ou passe diretamente na linha de comando sem alterar o arquivo:
@@ -276,6 +352,8 @@ Ou passe diretamente na linha de comando sem alterar o arquivo:
 ```bash
 VECTOR_SEARCHER=hnsw docker compose up --build
 BUILD_HNSW=true VECTOR_SEARCHER=hnsw docker compose up --build
+BUILD_IVF=true VECTOR_SEARCHER=ivf docker compose up --build
+BUILD_IVF=true IVF_NLIST=2048 VECTOR_SEARCHER=ivf IVF_NPROBE=64 docker compose up --build
 ```
 
 ### Testes
@@ -302,6 +380,15 @@ VECTOR_SEARCHER=hnsw docker compose up --build
 
 # Pré-construir o grafo HNSW na imagem — startup rápido (ann.Load)
 BUILD_HNSW=true VECTOR_SEARCHER=hnsw docker compose up --build
+
+# IVF com SQ8 (padrão, ~45 MB/instância)
+BUILD_IVF=true VECTOR_SEARCHER=ivf docker compose up --build
+
+# IVF sem SQ8 (~168 MB/instância, distâncias exatas dentro do cluster)
+BUILD_IVF=true IVF_SQ8=false VECTOR_SEARCHER=ivf docker compose up --build
+
+# IVF com parâmetros customizados
+BUILD_IVF=true IVF_NLIST=2048 VECTOR_SEARCHER=ivf IVF_NPROBE=64 docker compose up --build
 
 # A API fica disponível em http://localhost:9999 (via nginx)
 # Acesso direto às instâncias: http://localhost:8080 e http://localhost:8081
@@ -380,6 +467,7 @@ Os arquivos em `resources/` são carregados na inicialização da aplicação e 
 | `references.json.gz` | Fonte original: 3 milhões de transações rotuladas (`fraud`/`legit`), comprimida em gzip. Não é lida em runtime. |
 | `references.bin` | **Gerado por `cmd/preprocess`**. Binário flat SoA com float32 + uint8. Lido via mmap em runtime por todos os modos. |
 | `references.hnsw` | **Gerado por `cmd/preprocess`**. Grafo HNSW serializado. Carregado por `ann.Load` quando `VECTOR_SEARCHER=hnsw`; elimina o custo de build no startup. |
+| `references.ivf` | **Gerado por `cmd/preprocess`** quando `BUILD_IVF=true`. Índice IVF: `[uint32 nlist][uint8 flags][opt. params SQ8][centroides][por cluster: size + vetores + labels]`. ~45 MB com `IVF_SQ8=true`, ~168 MB com `IVF_SQ8=false`. Obrigatório para `VECTOR_SEARCHER=ivf`. |
 | `mcc_risk.json` | Mapa de MCC para score de risco (0.0–1.0); MCCs ausentes usam `0.5` como padrão |
 | `normalization.json` | Constantes usadas na normalização dos campos do payload para o vetor |
 
@@ -390,7 +478,7 @@ Exemplos de payloads e vetores de referência para testes locais estão em `reso
 O processo de avaliação de cada transação segue três etapas:
 
 1. **Vectorização** — os campos do payload são normalizados em um vetor de 14 dimensões (valores entre `0.0` e `1.0`, exceto `minutes_since_last_tx` e `km_from_last_tx` que recebem `-1` quando `last_transaction` é `null`).
-2. **Busca KNN** — os 5 vetores mais próximos são buscados na base de referência usando distância euclidiana. O backend é selecionado via `VECTOR_SEARCHER`: `brute` (exato, O(N), padrão) ou `hnsw` (aproximado, O(log N)).
+2. **Busca KNN** — os 5 vetores mais próximos são buscados na base de referência usando distância euclidiana. O backend é selecionado via `VECTOR_SEARCHER`: `brute` (exato, O(N), padrão), `hnsw` (aproximado, O(log N)) ou `ivf` (aproximado IVF-SQ8, O(nprobe·N/nlist)).
 3. **Decisão** — `fraud_score = fraudes_entre_os_5 / 5`; `approved = fraud_score < 0.6`.
 
 A especificação completa das 14 dimensões e das fórmulas de normalização está em [`docs/REGRAS_DE_DETECCAO.md`](./docs/REGRAS_DE_DETECCAO.md).

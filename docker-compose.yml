@@ -23,6 +23,9 @@ services:
       context: .
       args:
         BUILD_HNSW: ${BUILD_HNSW:-false}
+        BUILD_IVF: ${BUILD_IVF:-false}
+        IVF_NLIST: ${IVF_NLIST:-1024}
+        IVF_SQ8: ${IVF_SQ8:-true}
     platform: linux/amd64
     ports:
       - "8080:8080"
@@ -32,17 +35,21 @@ services:
     environment:
       - LOG_LEVEL=error
       - VECTOR_SEARCHER=${VECTOR_SEARCHER:-brute}
+      - IVF_NPROBE=${IVF_NPROBE:-32}
     deploy:
       resources:
         limits:
-          cpus: "2.45"
-          memory: "3665MB"
+          cpus: "0.45"
+          memory: "165MB"
 
   api-2:
     build:
       context: .
       args:
         BUILD_HNSW: ${BUILD_HNSW:-false}
+        BUILD_IVF: ${BUILD_IVF:-false}
+        IVF_NLIST: ${IVF_NLIST:-1024}
+        IVF_SQ8: ${IVF_SQ8:-true}
     platform: linux/amd64
     ports:
       - "8081:8080"
@@ -52,11 +59,12 @@ services:
     environment:
       - LOG_LEVEL=error
       - VECTOR_SEARCHER=${VECTOR_SEARCHER:-brute}
+      - IVF_NPROBE=${IVF_NPROBE:-32}
     deploy:
       resources:
         limits:
-          cpus: "2.45"
-          memory: "3665MB"
+          cpus: "0.45"
+          memory: "165MB"
 
 networks:
   api-network:

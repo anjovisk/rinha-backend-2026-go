@@ -12,6 +12,11 @@
 //
 //	VECTOR_SEARCHER=brute  exact brute-force O(N) scan via mmap (default)
 //	VECTOR_SEARCHER=hnsw   approximate HNSW O(log N) in-memory graph
+//	VECTOR_SEARCHER=ivf    approximate IVF-SQ8, requires resources/references.ivf
+//
+// IVF tuning knobs (only when VECTOR_SEARCHER=ivf):
+//
+//	IVF_NPROBE  number of clusters searched per query (default 32); higher = better recall, slower
 //
 // Usage:
 //
@@ -19,6 +24,7 @@
 //	PORT=8081 ./server
 //	LOG_LEVEL=debug ./server
 //	VECTOR_SEARCHER=hnsw ./server
+//	VECTOR_SEARCHER=ivf IVF_NPROBE=64 ./server
 package main
 
 import (
@@ -26,12 +32,14 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strconv"
 
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 
 	httphandler "anjovisk/fraud-detection/internal/adapter/http"
-	"anjovisk/fraud-detection/internal/adapter/ann"
+	"anjovisk/fraud-detection/internal/adapter/hnsw"
+	"anjovisk/fraud-detection/internal/adapter/ivf"
 	"anjovisk/fraud-detection/internal/adapter/knn"
 	"anjovisk/fraud-detection/internal/adapter/vector"
 	"anjovisk/fraud-detection/internal/port"
@@ -132,23 +140,24 @@ func loadNormalization(path string, logger *zap.Logger) normalizationConfig {
 }
 
 // buildNeighborFinder instantiates the NeighborFinder specified by kind.
-// "hnsw" selects the approximate HNSW adapter; any other value (including "brute"
-// or empty string) selects the exact brute-force adapter. The logger should already
-// be named (e.g. logger.Named("knn")).
+// The logger should already be named (e.g. logger.Named("knn")).
 //
-// When kind is "hnsw" and resources/references.hnsw exists (produced by cmd/preprocess),
-// the pre-built graph is loaded via ann.Load — O(N) instead of O(N log N) build.
-// If the file is absent, the graph is built from scratch with a Warn log.
+//   - "hnsw": approximate HNSW graph; loads references.hnsw if present (fast),
+//     otherwise builds from references.bin (slow, emits Warn).
+//   - "ivf": approximate IVF-SQ8; requires references.ivf (Fatal if absent —
+//     run preprocess with BUILD_IVF=true). IVF_NPROBE controls recall vs speed.
+//   - anything else (including "brute" or ""): exact brute-force O(N) scan.
 func buildNeighborFinder(kind string, logger *zap.Logger) port.NeighborFinder {
 	const refsPath = "resources/references.bin"
 	const hnswPath = "resources/references.hnsw"
+	const ivfPath = "resources/references.ivf"
 	switch kind {
 	case "hnsw":
 		if _, err := os.Stat(hnswPath); err == nil {
 			logger.Info("neighbor finder: HNSW (loading pre-built index)",
 				zap.String("graph_path", hnswPath),
 			)
-			s, err := ann.Load(hnswPath, refsPath, logger)
+			s, err := hnsw.Load(hnswPath, refsPath, logger)
 			if err != nil {
 				logger.Fatal("failed to load HNSW index", zap.Error(err))
 			}
@@ -157,9 +166,27 @@ func buildNeighborFinder(kind string, logger *zap.Logger) port.NeighborFinder {
 		logger.Warn("neighbor finder: HNSW (building from scratch — run preprocess to pre-build)",
 			zap.String("missing", hnswPath),
 		)
-		s, err := ann.Open(refsPath, logger)
+		s, err := hnsw.Open(refsPath, logger)
 		if err != nil {
 			logger.Fatal("failed to build HNSW index", zap.Error(err))
+		}
+		return s
+	case "ivf":
+		nprobe := ivf.DefaultNprobe
+		if raw := os.Getenv("IVF_NPROBE"); raw != "" {
+			if n, err := strconv.Atoi(raw); err == nil && n > 0 {
+				nprobe = n
+			}
+		}
+		logger.Info("neighbor finder: IVF-SQ8 (loading pre-built index)",
+			zap.String("index_path", ivfPath),
+			zap.Int("nprobe", nprobe),
+		)
+		s, err := ivf.Open(ivfPath, nprobe, logger)
+		if err != nil {
+			logger.Fatal("failed to load IVF-SQ8 index — run preprocess with BUILD_IVF=true",
+				zap.Error(err),
+			)
 		}
 		return s
 	default:
