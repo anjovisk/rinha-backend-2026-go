@@ -20,6 +20,9 @@ import (
 	"math"
 	"os"
 
+	"go.uber.org/zap"
+
+	"anjovisk/fraud-detection/internal/adapter/ann"
 	"anjovisk/fraud-detection/internal/domain"
 )
 
@@ -121,6 +124,33 @@ func main() {
 	}
 
 	log.Printf("done: %d entries → %s", count, outPath)
+
+	if os.Getenv("BUILD_HNSW") == "true" {
+		buildHNSW(outPath, count)
+	} else {
+		log.Printf("skipping HNSW index build (BUILD_HNSW != true)")
+	}
+}
+
+// buildHNSW builds an HNSW approximate index from binPath and exports it to
+// resources/references.hnsw. This runs once at build/preprocess time so the
+// server can call ann.Load instead of rebuilding the index on every startup.
+func buildHNSW(binPath string, count uint32) {
+	const hnswPath = "resources/references.hnsw"
+
+	log.Printf("building HNSW index (%d entries)…", count)
+
+	s, err := ann.Open(binPath, zap.NewNop())
+	if err != nil {
+		log.Fatalf("build HNSW index: %v", err)
+	}
+	defer s.Close() //nolint:errcheck
+
+	if err := s.Export(hnswPath); err != nil {
+		log.Fatalf("export HNSW index: %v", err)
+	}
+
+	log.Printf("done: HNSW index → %s", hnswPath)
 }
 
 // isFiniteF32 reports whether f is neither NaN nor infinite.

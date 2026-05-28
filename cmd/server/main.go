@@ -8,11 +8,17 @@
 // Log verbosity is controlled by the LOG_LEVEL environment variable.
 // Accepted values: debug, info (default), warn, error.
 //
+// The nearest-neighbour backend is selected via VECTOR_SEARCHER:
+//
+//	VECTOR_SEARCHER=brute  exact brute-force O(N) scan via mmap (default)
+//	VECTOR_SEARCHER=hnsw   approximate HNSW O(log N) in-memory graph
+//
 // Usage:
 //
 //	./server
 //	PORT=8081 ./server
 //	LOG_LEVEL=debug ./server
+//	VECTOR_SEARCHER=hnsw ./server
 package main
 
 import (
@@ -25,8 +31,10 @@ import (
 	"go.uber.org/zap/zapcore"
 
 	httphandler "anjovisk/fraud-detection/internal/adapter/http"
+	"anjovisk/fraud-detection/internal/adapter/ann"
 	"anjovisk/fraud-detection/internal/adapter/knn"
 	"anjovisk/fraud-detection/internal/adapter/vector"
+	"anjovisk/fraud-detection/internal/port"
 	"anjovisk/fraud-detection/internal/usecase"
 )
 
@@ -49,11 +57,10 @@ func main() {
 	mccRisk := loadMCCRisk("resources/mcc_risk.json", logger)
 	logger.Debug("MCC risk table loaded", zap.Int("entries", len(mccRisk)))
 
-	searcher, err := knn.Open("resources/references.bin", logger.Named("knn"))
-	if err != nil {
-		logger.Fatal("failed to open reference index", zap.Error(err))
+	nf := buildNeighborFinder(os.Getenv("VECTOR_SEARCHER"), logger.Named("knn"))
+	if c, ok := nf.(interface{ Close() error }); ok {
+		defer c.Close() //nolint:errcheck
 	}
-	defer searcher.Close() //nolint:errcheck
 
 	vec := vector.New(vector.Config{
 		MaxAmount:            norm.MaxAmount,
@@ -66,7 +73,7 @@ func main() {
 		MCCRisk:              mccRisk,
 	}, logger.Named("vectorizer"))
 
-	fraudUC := usecase.NewFraudScore(vec, searcher, logger.Named("usecase"))
+	fraudUC := usecase.NewFraudScore(vec, nf, logger.Named("usecase"))
 	srv := httphandler.NewServer(fraudUC, logger.Named("http"))
 
 	logger.Info("server ready", zap.String("port", port))
@@ -122,6 +129,47 @@ func loadNormalization(path string, logger *zap.Logger) normalizationConfig {
 		logger.Fatal("failed to decode normalization file", zap.String("path", path), zap.Error(err))
 	}
 	return cfg
+}
+
+// buildNeighborFinder instantiates the NeighborFinder specified by kind.
+// "hnsw" selects the approximate HNSW adapter; any other value (including "brute"
+// or empty string) selects the exact brute-force adapter. The logger should already
+// be named (e.g. logger.Named("knn")).
+//
+// When kind is "hnsw" and resources/references.hnsw exists (produced by cmd/preprocess),
+// the pre-built graph is loaded via ann.Load — O(N) instead of O(N log N) build.
+// If the file is absent, the graph is built from scratch with a Warn log.
+func buildNeighborFinder(kind string, logger *zap.Logger) port.NeighborFinder {
+	const refsPath = "resources/references.bin"
+	const hnswPath = "resources/references.hnsw"
+	switch kind {
+	case "hnsw":
+		if _, err := os.Stat(hnswPath); err == nil {
+			logger.Info("neighbor finder: HNSW (loading pre-built index)",
+				zap.String("graph_path", hnswPath),
+			)
+			s, err := ann.Load(hnswPath, refsPath, logger)
+			if err != nil {
+				logger.Fatal("failed to load HNSW index", zap.Error(err))
+			}
+			return s
+		}
+		logger.Warn("neighbor finder: HNSW (building from scratch — run preprocess to pre-build)",
+			zap.String("missing", hnswPath),
+		)
+		s, err := ann.Open(refsPath, logger)
+		if err != nil {
+			logger.Fatal("failed to build HNSW index", zap.Error(err))
+		}
+		return s
+	default:
+		logger.Info("neighbor finder: brute-force (exact)", zap.String("vector_searcher", kind))
+		s, err := knn.Open(refsPath, logger)
+		if err != nil {
+			logger.Fatal("failed to open reference index", zap.Error(err))
+		}
+		return s
+	}
 }
 
 // loadMCCRisk reads and decodes the MCC-to-risk-score map from path.

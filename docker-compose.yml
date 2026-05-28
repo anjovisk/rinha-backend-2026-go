@@ -19,32 +19,44 @@ services:
           memory: "20MB"
 
   api-1:
-    build: .
+    build:
+      context: .
+      args:
+        BUILD_HNSW: ${BUILD_HNSW:-false}
     platform: linux/amd64
     ports:
       - "8080:8080"
     networks:
       - api-network
     restart: unless-stopped
+    environment:
+      - LOG_LEVEL=error
+      - VECTOR_SEARCHER=${VECTOR_SEARCHER:-brute}
     deploy:
       resources:
         limits:
-          cpus: "0.45"
-          memory: "165MB"
+          cpus: "2.45"
+          memory: "3665MB"
 
   api-2:
-    build: .
+    build:
+      context: .
+      args:
+        BUILD_HNSW: ${BUILD_HNSW:-false}
     platform: linux/amd64
     ports:
       - "8081:8080"
     networks:
       - api-network
     restart: unless-stopped
+    environment:
+      - LOG_LEVEL=error
+      - VECTOR_SEARCHER=${VECTOR_SEARCHER:-brute}
     deploy:
       resources:
         limits:
-          cpus: "0.45"
-          memory: "165MB"
+          cpus: "2.45"
+          memory: "3665MB"
 
 networks:
   api-network:

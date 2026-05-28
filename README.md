@@ -31,11 +31,13 @@ O Nginx atua como load balancer em round-robin. Nenhuma lógica de negócio é e
                   │ port.Vectorizer           │ port.NeighborFinder
                   ▼                           ▼
 ┌──────────────────────┐       ┌──────────────────────────────┐
-│   adapter/vector     │       │        adapter/knn           │
-│   Vectorize()        │       │        FindNearest()         │
-│   (14 dimensões)     │       │  (brute-force sobre os      │
-│   normalization.json │       │   3M vetores de referência) │
-│   mcc_risk.json      │       │   references.json.gz        │
+│   adapter/vector     │       │  adapter/knn  (VECTOR_SEARCHER= │
+│   Vectorize()        │       │   brute)  ou  adapter/ann    │
+│   (14 dimensões)     │       │   (VECTOR_SEARCHER=hnsw)        │
+│   normalization.json │       │                              │
+│   mcc_risk.json      │       │   FindNearest() via          │
+│                      │       │   brute-force O(N) ou        │
+│                      │       │   HNSW aprox. O(log N)       │
 └──────────────────────┘       └──────────────────────────────┘
 ```
 
@@ -50,7 +52,8 @@ As dependências fluem sempre para dentro: adapters conhecem ports, ports conhec
 | `internal/usecase` | Aplicação | `FraudScore.Evaluate`: orquestra vetorização + KNN + cálculo do score |
 | `internal/adapter/http` | Adapter primário | HTTP handlers, parsing de JSON, mapeamento para domínio |
 | `internal/adapter/vector` | Adapter secundário | Normaliza o payload em vetor de 14 dimensões |
-| `internal/adapter/knn` | Adapter secundário | Busca KNN nos vetores de referência (brute-force, substituível por HNSW) |
+| `internal/adapter/knn` | Adapter secundário | Busca exata brute-force O(N) via mmap; selecionado por `VECTOR_SEARCHER=brute` (padrão) |
+| `internal/adapter/ann` | Adapter secundário | Busca aproximada HNSW O(log N) via `github.com/coder/hnsw`; selecionado por `VECTOR_SEARCHER=hnsw` |
 
 ## Stack
 
@@ -65,7 +68,7 @@ As dependências fluem sempre para dentro: adapters conhecem ports, ports conhec
 .
 ├── cmd/
 │   ├── preprocess/
-│   │   └── main.go                    # converte references.json.gz → references.bin (build time)
+│   │   └── main.go                    # converte references.json.gz → references.bin + references.hnsw
 │   └── server/
 │       └── main.go                    # bootstrap: carrega recursos, conecta adapters → usecase → HTTP
 ├── internal/
@@ -86,18 +89,23 @@ As dependências fluem sempre para dentro: adapters conhecem ports, ports conhec
 │       │   └── fraud_score.go         # POST /fraud-score
 │       ├── vector/
 │       │   └── vectorizer.go          # implementa Vectorizer
-│       └── knn/
-│           └── searcher.go            # implementa NeighborFinder
+│       ├── knn/
+│       │   └── searcher.go            # implementa NeighborFinder (brute-force exato, mmap)
+│       └── ann/
+│           └── hnsw.go                # implementa NeighborFinder (HNSW aproximado)
 ├── resources/
 │   ├── references.json.gz             # fonte original: 3M vetores rotulados (não lida em runtime)
 │   ├── references.bin                 # gerado por cmd/preprocess; lido via mmap em runtime
+│   ├── references.hnsw                # gerado por cmd/preprocess quando BUILD_HNSW=true; grafo HNSW serializado
 │   ├── mcc_risk.json                  # risco por categoria de merchant (MCC)
 │   └── normalization.json             # constantes de normalização
 ├── docs/                              # documentação em português
 ├── go.mod
-├── Dockerfile                         # build multi-stage; imagem final distroless/static
+├── .env                               # padrão local: VECTOR_SEARCHER=brute, BUILD_HNSW=false (não versionado)
+├── .env.example                       # template comentado de todas as variáveis
+├── Dockerfile                         # build multi-stage; ARG BUILD_HNSW controla geração do índice HNSW
 ├── nginx.conf                         # configuração do load balancer
-└── docker-compose.yml                 # nginx (:9999) + api-1 (:8080) + api-2 (:8081)
+└── docker-compose.yml                 # nginx (:9999) + api-1 (:8080) + api-2 (:8081); lê .env
 ```
 
 ## Pré-requisitos
@@ -156,20 +164,22 @@ docker compose version
 
 ### Pré-processamento da base de referência
 
-O servidor não lê `references.json.gz` diretamente. Antes de rodar a aplicação pela primeira vez, gere o arquivo binário `references.bin`:
+O servidor não lê `references.json.gz` diretamente. Antes de rodar a aplicação pela primeira vez, execute o preprocess:
 
 ```bash
+# Apenas references.bin (padrão — suficiente para VECTOR_SEARCHER=brute)
 go run ./cmd/preprocess
-# Gera: resources/references.bin
+
+# references.bin + references.hnsw (necessário para VECTOR_SEARCHER=hnsw com startup rápido)
+BUILD_HNSW=true go run ./cmd/preprocess
 ```
 
-Esse passo converte os 3 milhões de vetores do formato JSON para um binário compacto com layout SoA (Struct of Arrays):
+O preprocess produz até dois arquivos:
 
-```
-[uint32 N]  número de entradas
-[N × 56 B]  vetores em float32, row-major (14 dimensões por entrada)
-[N × 1 B]   labels: 1 = fraud, 0 = legit
-```
+| Arquivo | Quando gerado | O que é | Usado por |
+|---------|--------------|---------|-----------|
+| `references.bin` | Sempre | Binário flat SoA: `[uint32 N][N×56 B float32][N×1 B uint8]` | Todos os modos — lido via mmap em runtime |
+| `references.hnsw` | `BUILD_HNSW=true` | Grafo HNSW serializado pelo `coder/hnsw` | `VECTOR_SEARCHER=hnsw` com `ann.Load` — startup rápido |
 
 **Por que o binário?**
 
@@ -180,24 +190,46 @@ Esse passo converte os 3 milhões de vetores do formato JSON para um binário co
 
 Com `mmap`, as duas instâncias da API compartilham as mesmas páginas físicas no page cache do kernel — o arquivo ocupa ~171 MB na RAM, não ~342 MB. Isso mantém o uso total dentro do budget de 350 MB.
 
-O `references.bin` não é versionado no repositório. Em Docker, o passo é executado automaticamente durante o `docker compose up --build` (ver `Dockerfile`).
+Nenhum dos dois arquivos é versionado no repositório. Em Docker, o preprocess é executado automaticamente durante o build da imagem (ver `Dockerfile`); `BUILD_HNSW` é passado como build arg pelo docker-compose.
+
+### Backend de busca vetorial
+
+O algoritmo usado para encontrar os 5 vizinhos mais próximos é controlado pela variável de ambiente `VECTOR_SEARCHER`:
+
+| `VECTOR_SEARCHER` | Algoritmo | Complexidade de query | Startup | RSS extra por instância | Recall |
+|---|---|---|---|---|---|
+| `brute` (padrão) | Brute-force exato | O(N) | < 1 s (mmap) | 0 — vetores compartilhados via page cache | 100% |
+| `hnsw` + `references.hnsw` presente | HNSW aprox. (`coder/hnsw`, M=4, EfSearch=50) — **Load** | O(log N) | < 1 s (import) | ~170 MB heap (vetores alocados pelo Import) | ~93–97% |
+| `hnsw` + `references.hnsw` ausente | HNSW aprox. — **Open** (build from scratch) | O(log N) | dezenas de segundos (O(N log N)) | ~50–100 MB heap (conexões apenas; vetores no mmap) | ~93–97% |
+
+Quando `VECTOR_SEARCHER=hnsw`, o servidor detecta automaticamente se `resources/references.hnsw` existe:
+- **Arquivo presente** (`cmd/preprocess` foi executado): usa `ann.Load` — carrega o grafo serializado em O(N), sem custo de build. Vetores ficam em heap (~170 MB por instância).
+- **Arquivo ausente**: usa `ann.Open` — constrói o grafo em O(N log N), mais lento para iniciar, mas vetores ficam no mmap (~0 MB heap extra). Um `Warn` é emitido no log.
+
+> **Budget de memória:** com `hnsw` + `Load`, cada instância usa ~170 MB de heap adicional para os vetores. Com duas instâncias, isso soma ~340 MB só para vetores — deixando pouca margem no budget de 350 MB. Use `hnsw` + `Open` se a memória for crítica, ou `hnsw` + `Load` em ambientes com mais RAM.
 
 ### Rodar a aplicação
 
 ```bash
-# Gerar o binário de referência (apenas na primeira vez ou após atualizar references.json.gz)
-go run ./cmd/preprocess
-
 go build -o server ./cmd/server
+
+# Apenas references.bin — suficiente para VECTOR_SEARCHER=brute
+go run ./cmd/preprocess
 ./server
-# A API fica disponível em http://localhost:8080
+
+# Com índice HNSW pré-construído — startup rápido para VECTOR_SEARCHER=hnsw
+BUILD_HNSW=true go run ./cmd/preprocess
+VECTOR_SEARCHER=hnsw ./server
 ```
 
-A porta pode ser alterada via variável de ambiente:
+### Variáveis de ambiente
 
-```bash
-PORT=8081 ./server
-```
+| Variável | Padrão | Escopo | Descrição |
+|----------|--------|--------|-----------|
+| `PORT` | `8080` | Runtime | Porta de escuta da instância |
+| `LOG_LEVEL` | `info` | Runtime | Nível mínimo de log (`debug`, `info`, `warn`, `error`) |
+| `VECTOR_SEARCHER` | `brute` | Runtime | Backend de busca vetorial (`brute` ou `hnsw`) |
+| `BUILD_HNSW` | `false` | Build time | Quando `true`, `cmd/preprocess` gera `references.hnsw`; passado como `ARG` ao Dockerfile |
 
 ### Logs
 
@@ -222,15 +254,28 @@ A saída é JSON estruturado via **uber-go/zap**, adequada para ingestão em Dat
 {"level":"debug","ts":1741723415.127,"logger":"http","msg":"sending response","transaction_id":"tx-123","approved":true,"fraud_score":0.2}
 ```
 
-#### Logs em Docker Compose
+#### Variáveis de ambiente no Docker Compose
 
-Para alterar o nível nas instâncias da API, passe `LOG_LEVEL` como variável de ambiente no `docker-compose.yml`:
+O `docker-compose.yml` lê as variáveis do arquivo `.env` na raiz do projeto. As duas variáveis relevantes para o Compose são:
 
-```yaml
-services:
-  api-1:
-    environment:
-      - LOG_LEVEL=debug
+| Variável | Tipo | Descrição |
+|----------|------|-----------|
+| `VECTOR_SEARCHER` | Runtime env | Backend de busca (`brute` ou `hnsw`); injetado em cada instância de API |
+| `BUILD_HNSW` | Build arg (`ARG`) | Quando `true`, `cmd/preprocess` gera `references.hnsw` durante o `docker build` |
+
+Para trocar o backend ou habilitar o pré-build, edite o `.env`:
+
+```bash
+# .env
+VECTOR_SEARCHER=hnsw
+BUILD_HNSW=true   # gera references.hnsw no build — necessário para startup rápido com hnsw
+```
+
+Ou passe diretamente na linha de comando sem alterar o arquivo:
+
+```bash
+VECTOR_SEARCHER=hnsw docker compose up --build
+BUILD_HNSW=true VECTOR_SEARCHER=hnsw docker compose up --build
 ```
 
 ### Testes
@@ -249,14 +294,20 @@ go test ./internal/adapter/http/
 ## Rodando com Docker
 
 ```bash
-# Build e sobe toda a stack (Nginx + 2 instâncias da API)
+# Build e sobe com o backend definido em .env
 docker compose up --build
+
+# Trocar para HNSW sem editar o .env (usa ann.Open se references.hnsw não estiver na imagem)
+VECTOR_SEARCHER=hnsw docker compose up --build
+
+# Pré-construir o grafo HNSW na imagem — startup rápido (ann.Load)
+BUILD_HNSW=true VECTOR_SEARCHER=hnsw docker compose up --build
 
 # A API fica disponível em http://localhost:9999 (via nginx)
 # Acesso direto às instâncias: http://localhost:8080 e http://localhost:8081
 ```
 
-Para rebuild da imagem da aplicação sem cache:
+Para rebuild da imagem sem cache:
 
 ```bash
 docker compose build --no-cache
@@ -327,7 +378,8 @@ Os arquivos em `resources/` são carregados na inicialização da aplicação e 
 | Arquivo | Descrição |
 |---------|-----------|
 | `references.json.gz` | Fonte original: 3 milhões de transações rotuladas (`fraud`/`legit`), comprimida em gzip. Não é lida em runtime. |
-| `references.bin` | **Gerado por `cmd/preprocess`**. Binário flat SoA com float32 + uint8. Lido via mmap em runtime. |
+| `references.bin` | **Gerado por `cmd/preprocess`**. Binário flat SoA com float32 + uint8. Lido via mmap em runtime por todos os modos. |
+| `references.hnsw` | **Gerado por `cmd/preprocess`**. Grafo HNSW serializado. Carregado por `ann.Load` quando `VECTOR_SEARCHER=hnsw`; elimina o custo de build no startup. |
 | `mcc_risk.json` | Mapa de MCC para score de risco (0.0–1.0); MCCs ausentes usam `0.5` como padrão |
 | `normalization.json` | Constantes usadas na normalização dos campos do payload para o vetor |
 
@@ -338,7 +390,7 @@ Exemplos de payloads e vetores de referência para testes locais estão em `reso
 O processo de avaliação de cada transação segue três etapas:
 
 1. **Vectorização** — os campos do payload são normalizados em um vetor de 14 dimensões (valores entre `0.0` e `1.0`, exceto `minutes_since_last_tx` e `km_from_last_tx` que recebem `-1` quando `last_transaction` é `null`).
-2. **Busca KNN** — os 5 vetores mais próximos são buscados na base de referência usando distância euclidiana (brute force ou índice ANN/VP-Tree).
+2. **Busca KNN** — os 5 vetores mais próximos são buscados na base de referência usando distância euclidiana. O backend é selecionado via `VECTOR_SEARCHER`: `brute` (exato, O(N), padrão) ou `hnsw` (aproximado, O(log N)).
 3. **Decisão** — `fraud_score = fraudes_entre_os_5 / 5`; `approved = fraud_score < 0.6`.
 
 A especificação completa das 14 dimensões e das fórmulas de normalização está em [`docs/REGRAS_DE_DETECCAO.md`](./docs/REGRAS_DE_DETECCAO.md).
