@@ -26,6 +26,11 @@ services:
         BUILD_IVF: ${BUILD_IVF:-false}
         IVF_NLIST: ${IVF_NLIST:-1024}
         IVF_SQ8: ${IVF_SQ8:-true}
+        BUILD_VAMANA: ${BUILD_VAMANA:-false}
+        VAMANA_R: ${VAMANA_R:-16}
+        VAMANA_BUILD_L: ${VAMANA_BUILD_L:-0}
+        VAMANA_ALPHA: ${VAMANA_ALPHA:-1.2}
+        VAMANA_SQ8: ${VAMANA_SQ8:-true}
     platform: linux/amd64
     ports:
       - "8080:8080"
@@ -36,6 +41,7 @@ services:
       - LOG_LEVEL=error
       - VECTOR_SEARCHER=${VECTOR_SEARCHER:-brute}
       - IVF_NPROBE=${IVF_NPROBE:-32}
+      - VAMANA_L=${VAMANA_L:-64}
     deploy:
       resources:
         limits:
@@ -50,6 +56,11 @@ services:
         BUILD_IVF: ${BUILD_IVF:-false}
         IVF_NLIST: ${IVF_NLIST:-1024}
         IVF_SQ8: ${IVF_SQ8:-true}
+        BUILD_VAMANA: ${BUILD_VAMANA:-false}
+        VAMANA_R: ${VAMANA_R:-16}
+        VAMANA_BUILD_L: ${VAMANA_BUILD_L:-0}
+        VAMANA_ALPHA: ${VAMANA_ALPHA:-1.2}
+        VAMANA_SQ8: ${VAMANA_SQ8:-true}
     platform: linux/amd64
     ports:
       - "8081:8080"
@@ -60,6 +71,7 @@ services:
       - LOG_LEVEL=error
       - VECTOR_SEARCHER=${VECTOR_SEARCHER:-brute}
       - IVF_NPROBE=${IVF_NPROBE:-32}
+      - VAMANA_L=${VAMANA_L:-64}
     deploy:
       resources:
         limits:

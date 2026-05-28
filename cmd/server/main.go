@@ -10,13 +10,18 @@
 //
 // The nearest-neighbour backend is selected via VECTOR_SEARCHER:
 //
-//	VECTOR_SEARCHER=brute  exact brute-force O(N) scan via mmap (default)
-//	VECTOR_SEARCHER=hnsw   approximate HNSW O(log N) in-memory graph
-//	VECTOR_SEARCHER=ivf    approximate IVF-SQ8, requires resources/references.ivf
+//	VECTOR_SEARCHER=brute   exact brute-force O(N) scan via mmap (default)
+//	VECTOR_SEARCHER=hnsw    approximate HNSW O(log N) in-memory graph
+//	VECTOR_SEARCHER=ivf     approximate IVF-SQ8, requires resources/references.ivf
+//	VECTOR_SEARCHER=vamana  approximate Vamana graph, requires resources/references.vamana
 //
 // IVF tuning knobs (only when VECTOR_SEARCHER=ivf):
 //
 //	IVF_NPROBE  number of clusters searched per query (default 32); higher = better recall, slower
+//
+// Vamana tuning knobs (only when VECTOR_SEARCHER=vamana):
+//
+//	VAMANA_L  beam width at query time (default 64); higher = better recall, slower
 //
 // Usage:
 //
@@ -25,6 +30,8 @@
 //	LOG_LEVEL=debug ./server
 //	VECTOR_SEARCHER=hnsw ./server
 //	VECTOR_SEARCHER=ivf IVF_NPROBE=64 ./server
+//	VECTOR_SEARCHER=vamana ./server
+//	VECTOR_SEARCHER=vamana VAMANA_L=128 ./server
 package main
 
 import (
@@ -41,6 +48,7 @@ import (
 	"anjovisk/fraud-detection/internal/adapter/hnsw"
 	"anjovisk/fraud-detection/internal/adapter/ivf"
 	"anjovisk/fraud-detection/internal/adapter/knn"
+	"anjovisk/fraud-detection/internal/adapter/vamana"
 	"anjovisk/fraud-detection/internal/adapter/vector"
 	"anjovisk/fraud-detection/internal/port"
 	"anjovisk/fraud-detection/internal/usecase"
@@ -146,11 +154,14 @@ func loadNormalization(path string, logger *zap.Logger) normalizationConfig {
 //     otherwise builds from references.bin (slow, emits Warn).
 //   - "ivf": approximate IVF-SQ8; requires references.ivf (Fatal if absent —
 //     run preprocess with BUILD_IVF=true). IVF_NPROBE controls recall vs speed.
+//   - "vamana": approximate Vamana graph; requires references.vamana (Fatal if absent —
+//     run preprocess with BUILD_VAMANA=true). VAMANA_L controls beam width at query time.
 //   - anything else (including "brute" or ""): exact brute-force O(N) scan.
 func buildNeighborFinder(kind string, logger *zap.Logger) port.NeighborFinder {
 	const refsPath = "resources/references.bin"
 	const hnswPath = "resources/references.hnsw"
 	const ivfPath = "resources/references.ivf"
+	const vamanaPath = "resources/references.vamana"
 	switch kind {
 	case "hnsw":
 		if _, err := os.Stat(hnswPath); err == nil {
@@ -185,6 +196,24 @@ func buildNeighborFinder(kind string, logger *zap.Logger) port.NeighborFinder {
 		s, err := ivf.Open(ivfPath, nprobe, logger)
 		if err != nil {
 			logger.Fatal("failed to load IVF-SQ8 index — run preprocess with BUILD_IVF=true",
+				zap.Error(err),
+			)
+		}
+		return s
+	case "vamana":
+		l := vamana.DefaultL
+		if raw := os.Getenv("VAMANA_L"); raw != "" {
+			if n, err := strconv.Atoi(raw); err == nil && n > 0 {
+				l = n
+			}
+		}
+		logger.Info("neighbor finder: Vamana (loading pre-built index)",
+			zap.String("index_path", vamanaPath),
+			zap.Int("L", l),
+		)
+		s, err := vamana.Open(vamanaPath, l, logger)
+		if err != nil {
+			logger.Fatal("failed to load Vamana index — run preprocess with BUILD_VAMANA=true",
 				zap.Error(err),
 			)
 		}
