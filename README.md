@@ -30,17 +30,21 @@ O Nginx atua como load balancer em round-robin. Nenhuma lógica de negócio é e
 └─────────────────┬──────────────────────────┬─────────────────┘
                   │ port.Vectorizer           │ port.NeighborFinder
                   ▼                           ▼
-┌──────────────────────┐       ┌────────────────────────────────────────┐
-│   adapter/vector     │       │  adapter/knn    (VECTOR_SEARCHER=brute)│
-│   Vectorize()        │       │  adapter/hnsw   (VECTOR_SEARCHER=hnsw) │
-│   (14 dimensões)     │       │  adapter/ivf    (VECTOR_SEARCHER=ivf)  │
-│   normalization.json │       │  adapter/vamana (VECTOR_SEARCHER=vamana│
-│   mcc_risk.json      │       │                                        │
-│                      │       │  FindNearest() via brute O(N),         │
-│                      │       │  HNSW aprox. O(log N),                 │
-│                      │       │  IVF-SQ8 aprox. O(nprobe·N/nlist) ou  │
-│                      │       │  Vamana aprox. O(L·R)                  │
-└──────────────────────┘       └────────────────────────────────────────┘
+┌──────────────────────┐       ┌──────────────────────────────────────────────┐
+│   adapter/vector     │       │  adapter/knn       (VECTOR_SEARCHER=brute)   │
+│   Vectorize()        │       │  adapter/hnsw      (VECTOR_SEARCHER=hnsw)    │
+│   (14 dimensões)     │       │  adapter/ivf       (VECTOR_SEARCHER=ivf)     │
+│   normalization.json │       │  adapter/vamana    (VECTOR_SEARCHER=vamana)  │
+│   mcc_risk.json      │       │  adapter/partition (VECTOR_SEARCHER=partition│
+│                      │       │  adapter/vptree    (VECTOR_SEARCHER=vptree)  │
+│                      │       │                                              │
+│                      │       │  FindNearest() via brute O(N),               │
+│                      │       │  HNSW aprox. O(log N),                       │
+│                      │       │  IVF-SQ8 aprox. O(nprobe·N/nlist),           │
+│                      │       │  Vamana aprox. O(L·R),                       │
+│                      │       │  partition-brute O(N/bins) ou                │
+│                      │       │  VP-Tree exato O(N^α) α < 1 (c/ poda)        │
+└──────────────────────┘       └──────────────────────────────────────────────┘
 ```
 
 As dependências fluem sempre para dentro: adapters conhecem ports, ports conhecem o domínio. O domínio não importa nenhum pacote interno.
@@ -58,6 +62,8 @@ As dependências fluem sempre para dentro: adapters conhecem ports, ports conhec
 | `internal/adapter/hnsw` | Adapter secundário | Busca aproximada HNSW O(log N) via `github.com/coder/hnsw`; selecionado por `VECTOR_SEARCHER=hnsw` |
 | `internal/adapter/ivf` | Adapter secundário | Busca aproximada IVF-SQ8; K-means + quantização uint8; selecionado por `VECTOR_SEARCHER=ivf` |
 | `internal/adapter/vamana` | Adapter secundário | Busca aproximada Vamana/DiskANN O(L·R); grafo flat com RobustPrune; mmap compartilhado; selecionado por `VECTOR_SEARCHER=vamana` |
+| `internal/adapter/partition` | Adapter secundário | Busca exata particionada; roteia cada query para um dos 6 sub-índices por `(last_tx_null × is_online × card_present)`; ~3,2× mais rápido que brute sem arquivo de índice extra; selecionado por `VECTOR_SEARCHER=partition` |
+| `internal/adapter/vptree` | Adapter secundário | VP-Tree exato por bin; mesma partição do `partition` + poda pela desigualdade triangular; construído no startup em O(N log N); selecionado por `VECTOR_SEARCHER=vptree` |
 
 ## Stack
 
@@ -102,10 +108,16 @@ As dependências fluem sempre para dentro: adapters conhecem ports, ports conhec
 │       │   ├── ivf.go                 # implementa NeighborFinder (IVF-SQ8 aproximado); Open e FindNearest
 │       │   ├── build.go               # K-means paralelo, quantização SQ8, Build e New
 │       │   └── ivf_test.go
-│       └── vamana/
-│           ├── vamana.go              # implementa NeighborFinder (Vamana aproximado); Open, New, FindNearest
-│           ├── build.go               # construção Vamana (RobustPrune, paralelo), Build e helpers SQ8
-│           └── vamana_test.go
+│       ├── vamana/
+│       │   ├── vamana.go              # implementa NeighborFinder (Vamana aproximado); Open, New, FindNearest
+│       │   ├── build.go               # construção Vamana (RobustPrune, paralelo), Build e helpers SQ8
+│       │   └── vamana_test.go
+│       ├── partition/
+│       │   ├── partition.go           # implementa NeighborFinder (brute-force particionado); Open, New, FindNearest
+│       │   └── partition_test.go
+│       └── vptree/
+│           ├── vptree.go              # implementa NeighborFinder (VP-Tree exato por bin); Open, New, FindNearest
+│           └── vptree_test.go
 ├── resources/
 │   ├── references.json.gz             # fonte original: 3M vetores rotulados (não lida em runtime)
 │   ├── references.bin                 # gerado por cmd/preprocess; lido via mmap em runtime
@@ -234,6 +246,8 @@ O algoritmo usado para encontrar os 5 vizinhos mais próximos é controlado pela
 | `VECTOR_SEARCHER` | Algoritmo | Complexidade de query | Startup | RSS extra por instância | Recall |
 |---|---|---|---|---|---|
 | `brute` (padrão) | Brute-force exato | O(N) | < 1 s (mmap) | 0 — vetores compartilhados via page cache | 100% |
+| `partition` | Brute-force particionado exato por bin | O(N/bins) ≈ O(N×0,31) | < 1 s (mmap + scan único) | ~12 MB heap (índices de ponteiros) | ~100% dentro do bin |
+| `vptree` | VP-Tree exato por bin (poda triangular) | O(N^α) α<1 c/ poda efetiva; O(N/bins) pior caso | alguns segundos (build O(N log N)) | ~16–20 MB heap (6 árvores) | ~100% dentro do bin |
 | `hnsw` + `references.hnsw` presente | HNSW aprox. (`coder/hnsw`, M=4, EfSearch=50) — **Load** | O(log N) | < 1 s (import) | ~170 MB heap (vetores alocados pelo Import) | ~93–97% |
 | `hnsw` + `references.hnsw` ausente | HNSW aprox. — **Open** (build from scratch) | O(log N) | dezenas de segundos (O(N log N)) | ~50–100 MB heap (conexões apenas; vetores no mmap) | ~93–97% |
 | `ivf` + `IVF_SQ8=true` (padrão) | IVF aprox. com SQ8 (K-means + uint8) | O(nprobe·N/nlist) | < 1 s (leitura heap) | ~45 MB heap por instância | ~95–99% (nprobe=32) |
@@ -321,6 +335,88 @@ BUILD_VAMANA=true VAMANA_BUILD_L=64 docker compose up --build
 BUILD_VAMANA=true VAMANA_R=8 VAMANA_BUILD_L=64 docker compose up --build
 ```
 
+#### Particionamento por features discretas (`VECTOR_SEARCHER=partition`)
+
+O adapter `partition` foi desenvolvido após um estudo da estrutura do dataset. A ideia central é simples: se uma feature discreta do vetor já separa naturalmente os dados em grupos com pouca sobreposição, é possível dividir o dataset em sub-índices e rotear cada query apenas para o sub-índice correspondente — reduzindo o trabalho de busca sem nenhuma perda de precisão dentro da partição.
+
+##### Análise teórica
+
+Três features do vetor de 14 dimensões são binárias ou sentinel:
+
+| Dimensão | Feature | Valores |
+|:---:|---|---|
+| 5 | `minutes_since_last_tx` | `[-1, 0..1]` — `-1` quando `last_transaction: null` |
+| 6 | `km_from_last_tx` | `[-1, 0..1]` — `-1` quando `last_transaction: null` |
+| 9 | `is_online` | `0` ou `1` |
+| 10 | `card_present` | `0` ou `1` |
+
+A questão é: qual o custo em distância L² de cruzar a fronteira de uma partição?
+
+**Sentinel `-1` (dims 5 e 6):** quando uma transação tem `last_transaction: null`, seus dims 5 e 6 valem `-1`. Qualquer referência com `last_transaction` presente terá esses dims em `[0, 1]`. A diferença mínima é `0 − (−1) = 1` por dim, adicionando pelo menos `1² + 1² = 2,0` à distância quadrática. Como a distância L² esperada entre dois pontos aleatórios em `[0, 1]^14` é ~2,33, um penálti de 2,0 é enorme — vizinhos cruzando essa fronteira seriam raridade.
+
+**Features binárias (dims 9 e 10):** um mismatch em `is_online` ou `card_present` adiciona `1² = 1,0` à distância quadrática (~43% da distância típica entre pontos). Cross-partition neighbors existem, mas são improvável de compor o top-5 quando o candidato na partição correta já está próximo em todas as outras dimensões.
+
+##### Distribuição real do dataset (3M referências)
+
+O estudo foi validado com uma análise completa das 3M referências:
+
+```
+last_tx_null  is_online  card_present |  entradas    %   fraude%
+--------------------------------------------------------------
+false         0          0            |   128.017   4,3%   13,5%
+false         0          1            | 1.156.177  38,5%   13,4%
+false         1          0            | 1.116.849  37,2%   56,2%
+true          0          0            |    32.201   1,1%   13,4%
+true          0          1            |   288.785   9,6%   13,4%
+true          1          0            |   277.971   9,3%   56,3%
+```
+
+Duas descobertas relevantes:
+
+1. **`is_online=1` e `card_present=1` são mutuamente exclusivos** — nenhuma das 3M referências tem os dois ativos ao mesmo tempo (faz sentido: transação online = cartão não está fisicamente presente). Das 8 combinações teóricas possíveis (3 bits), apenas 6 existem de fato.
+
+2. **A taxa de fraude difere drasticamente entre partições:** transações online têm ~56% de fraude vs ~13,4% das presenciais. Isso confirma que os vizinhos de uma transação online raramente estarão na partição offline — a separabilidade é real, não apenas teórica.
+
+##### Speedup esperado
+
+O speedup não é uniforme — cada query vai para a partição que corresponde às suas features. O trabalho médio de scan é a soma ponderada dos tamanhos das partições:
+
+| Partição | Tamanho | P(query cair aqui) | Entradas escaneadas |
+|---|:---:|:---:|---:|
+| offline, sem card, sem null-tx | 4,3% | 4,3% | ~5.500 |
+| offline, com card, sem null-tx | 38,5% | 38,5% | ~445.000 |
+| online, sem card, sem null-tx | 37,2% | 37,2% | ~415.000 |
+| offline, sem card, null-tx | 1,1% | 1,1% | ~350 |
+| offline, com card, null-tx | 9,6% | 9,6% | ~27.700 |
+| online, sem card, null-tx | 9,3% | 9,3% | ~25.900 |
+| **Média ponderada** | | | **~920.000** |
+
+Brute-force completo: 3.000.000 entradas. Partition: ~920.000 → **speedup médio de ~3,2×**.
+
+O `partition` é a melhor escolha quando se quer resultado **exato dentro da partição** (sem o risco de recall degradado dos métodos ANN) e sem precisar construir e armazenar um arquivo de índice separado. Depende apenas do `references.bin` já gerado pelo preprocess padrão.
+
+#### VP-Tree por bin (`VECTOR_SEARCHER=vptree`)
+
+O adapter `vptree` combina a mesma partição de 6 bins do `partition` com uma **vantage-point tree (VP-Tree)** construída para cada bin no startup. A VP-Tree é uma árvore métrica que, ao buscar, usa a desigualdade triangular para podar ramos inteiros sem avaliar cada ponto individualmente:
+
+```
+d(q, p) ≥ |d(q, vp) − d(vp, p)|
+```
+
+Se a distância mínima possível de qualquer ponto num ramo ao query for maior que o k-ésimo melhor candidato atual (`tau`), o ramo inteiro é descartado. Isso reduz o número de distâncias calculadas de O(N/bins) para sub-linear — quando a poda funciona.
+
+**Construção:** para cada bin, um vantage point é escolhido aleatoriamente, todos os pontos restantes são ordenados por distância euclidiana a ele e divididos ao meio. A partição esquerda (inner ball, dist ≤ radius) e direita (outer shell, dist > radius) são recursadas até os bins atingirem tamanho ≤ 32 entradas (leaf size), onde a busca é bruta. Custo: O(N log N) por bin.
+
+**Busca:** ao visitar cada nó interno, o query é comparado contra o vantage point e tau é atualizado. A condição de poda:
+- `d + tau < radius` → pula o ramo externo (outer shell muito longe)
+- `d − tau > radius` → pula o ramo interno (inner ball muito longe)
+
+A eficácia da poda depende da **dimensionalidade intrínseca** dos dados em cada bin. Com dims fixas pelo roteamento (2–4 dimensões constantes por bin), a dimensionalidade efetiva cai para 10–12. No pior caso (distribuição uniforme), a VP-Tree degenera para O(N/bins) como o `partition`. No melhor caso, aproxima-se de O(log N).
+
+**Memória e startup:** mmap compartilhado (~171 MB) + ~16–20 MB heap para as 6 árvores. Build de alguns segundos no startup; sem arquivo de índice extra.
+
+---
+
 #### Ranqueamento de configurações IVF
 
 A memória do índice depende de `IVF_SQ8`: **~45 MB com SQ8** (padrão) ou **~168 MB sem SQ8**. O tradeoff principal continua sendo latência de busca vs recall, controlado por `IVF_NLIST` e `IVF_NPROBE`. A tabela abaixo assume `IVF_SQ8=true` (SQ8 ativo). A tabela abaixo mostra as configurações mais relevantes para a base de N = 3.000.000 vetores com D = 14 dimensões.
@@ -373,6 +469,12 @@ VECTOR_SEARCHER=vamana ./server
 
 # Vamana com beam width maior em runtime (mais recall, sem rebuild)
 VECTOR_SEARCHER=vamana VAMANA_L=128 ./server
+
+# Partition-brute: exato por bin, ~3.2× mais rápido que brute, sem arquivo extra
+VECTOR_SEARCHER=partition ./server
+
+# VP-Tree: exato por bin com poda triangular, construído no startup (~alguns segundos)
+VECTOR_SEARCHER=vptree ./server
 ```
 
 ### Variáveis de ambiente
@@ -381,7 +483,7 @@ VECTOR_SEARCHER=vamana VAMANA_L=128 ./server
 |----------|--------|--------|-----------|
 | `PORT` | `8080` | Runtime | Porta de escuta da instância |
 | `LOG_LEVEL` | `info` | Runtime | Nível mínimo de log (`debug`, `info`, `warn`, `error`) |
-| `VECTOR_SEARCHER` | `brute` | Runtime | Backend de busca vetorial (`brute`, `hnsw`, `ivf` ou `vamana`) |
+| `VECTOR_SEARCHER` | `brute` | Runtime | Backend de busca vetorial (`brute`, `partition`, `vptree`, `hnsw`, `ivf` ou `vamana`) |
 | `IVF_NPROBE` | `32` | Runtime | Clusters pesquisados por query com `VECTOR_SEARCHER=ivf`; maior = mais recall e mais lento |
 | `VAMANA_L` | `64` | Runtime | Beam width na busca com `VECTOR_SEARCHER=vamana`; maior = mais recall e mais lento |
 | `BUILD_HNSW` | `false` | Build time | Quando `true`, `cmd/preprocess` gera `references.hnsw`; passado como `ARG` ao Dockerfile |
@@ -423,7 +525,7 @@ O `docker-compose.yml` lê as variáveis do arquivo `.env` na raiz do projeto. A
 
 | Variável | Tipo | Descrição |
 |----------|------|-----------|
-| `VECTOR_SEARCHER` | Runtime env | Backend de busca (`brute`, `hnsw`, `ivf` ou `vamana`); injetado em cada instância de API |
+| `VECTOR_SEARCHER` | Runtime env | Backend de busca (`brute`, `partition`, `vptree`, `hnsw`, `ivf` ou `vamana`); injetado em cada instância de API |
 | `IVF_NPROBE` | Runtime env | Clusters pesquisados por query com `ivf` (padrão 32); injetado em cada instância |
 | `VAMANA_L` | Runtime env | Beam width na busca com `vamana` (padrão 64); injetado em cada instância |
 | `BUILD_HNSW` | Build arg (`ARG`) | Quando `true`, `cmd/preprocess` gera `references.hnsw` durante o `docker build` |
@@ -460,6 +562,12 @@ BUILD_IVF=true VECTOR_SEARCHER=ivf docker compose up --build
 BUILD_IVF=true IVF_NLIST=2048 VECTOR_SEARCHER=ivf IVF_NPROBE=64 docker compose up --build
 BUILD_VAMANA=true VECTOR_SEARCHER=vamana docker compose up --build
 BUILD_VAMANA=true VAMANA_R=8 VECTOR_SEARCHER=vamana VAMANA_L=64 docker compose up --build
+
+# Partition-brute: usa apenas references.bin, sem arquivo extra
+VECTOR_SEARCHER=partition docker compose up --build
+
+# VP-Tree: exato por bin, build no startup, sem arquivo extra
+VECTOR_SEARCHER=vptree docker compose up --build
 ```
 
 ### Testes
@@ -504,6 +612,9 @@ BUILD_VAMANA=true VAMANA_R=8 VECTOR_SEARCHER=vamana docker compose up --build
 
 # Vamana com beam width maior em runtime (sem rebuild)
 BUILD_VAMANA=true VECTOR_SEARCHER=vamana VAMANA_L=128 docker compose up --build
+
+# Partition-brute: exato por bin, sem arquivo de índice extra
+VECTOR_SEARCHER=partition docker compose up --build
 
 # A API fica disponível em http://localhost:9999 (via nginx)
 # Acesso direto às instâncias: http://localhost:8080 e http://localhost:8081
@@ -594,7 +705,7 @@ Exemplos de payloads e vetores de referência para testes locais estão em `reso
 O processo de avaliação de cada transação segue três etapas:
 
 1. **Vectorização** — os campos do payload são normalizados em um vetor de 14 dimensões (valores entre `0.0` e `1.0`, exceto `minutes_since_last_tx` e `km_from_last_tx` que recebem `-1` quando `last_transaction` é `null`).
-2. **Busca KNN** — os 5 vetores mais próximos são buscados na base de referência usando distância euclidiana. O backend é selecionado via `VECTOR_SEARCHER`: `brute` (exato, O(N), padrão), `hnsw` (aproximado, O(log N)), `ivf` (aproximado IVF-SQ8, O(nprobe·N/nlist)) ou `vamana` (aproximado Vamana/DiskANN, O(L·R)).
+2. **Busca KNN** — os 5 vetores mais próximos são buscados na base de referência usando distância euclidiana. O backend é selecionado via `VECTOR_SEARCHER`: `brute` (exato, O(N), padrão), `partition` (exato por bin, O(N/bins), ~3,2× mais rápido que brute), `vptree` (VP-Tree exato por bin com poda triangular, sub-linear quando a dimensionalidade intrínseca permite), `hnsw` (aproximado, O(log N)), `ivf` (aproximado IVF-SQ8, O(nprobe·N/nlist)) ou `vamana` (aproximado Vamana/DiskANN, O(L·R)).
 3. **Decisão** — `fraud_score = fraudes_entre_os_5 / 5`; `approved = fraud_score < 0.6`.
 
 A especificação completa das 14 dimensões e das fórmulas de normalização está em [`docs/REGRAS_DE_DETECCAO.md`](./docs/REGRAS_DE_DETECCAO.md).

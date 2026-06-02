@@ -10,10 +10,14 @@
 //
 // The nearest-neighbour backend is selected via VECTOR_SEARCHER:
 //
-//	VECTOR_SEARCHER=brute   exact brute-force O(N) scan via mmap (default)
-//	VECTOR_SEARCHER=hnsw    approximate HNSW O(log N) in-memory graph
-//	VECTOR_SEARCHER=ivf     approximate IVF-SQ8, requires resources/references.ivf
-//	VECTOR_SEARCHER=vamana  approximate Vamana graph, requires resources/references.vamana
+//	VECTOR_SEARCHER=brute      exact brute-force O(N) scan via mmap (default)
+//	VECTOR_SEARCHER=hnsw       approximate HNSW O(log N) in-memory graph
+//	VECTOR_SEARCHER=ivf        approximate IVF-SQ8, requires resources/references.ivf
+//	VECTOR_SEARCHER=vamana     approximate Vamana graph, requires resources/references.vamana
+//	VECTOR_SEARCHER=partition  partitioned brute-force; routes each query to one of 6 sub-indexes
+//	                           selected by (last_tx_null × is_online × card_present), scanning
+//	                           ~31% of the dataset on average (~3.2× speedup over brute).
+//	                           Exact within each partition; no separate index file required.
 //
 // IVF tuning knobs (only when VECTOR_SEARCHER=ivf):
 //
@@ -32,6 +36,7 @@
 //	VECTOR_SEARCHER=ivf IVF_NPROBE=64 ./server
 //	VECTOR_SEARCHER=vamana ./server
 //	VECTOR_SEARCHER=vamana VAMANA_L=128 ./server
+//	VECTOR_SEARCHER=partition ./server
 package main
 
 import (
@@ -48,8 +53,10 @@ import (
 	"anjovisk/fraud-detection/internal/adapter/hnsw"
 	"anjovisk/fraud-detection/internal/adapter/ivf"
 	"anjovisk/fraud-detection/internal/adapter/knn"
+	"anjovisk/fraud-detection/internal/adapter/partition"
 	"anjovisk/fraud-detection/internal/adapter/vamana"
 	"anjovisk/fraud-detection/internal/adapter/vector"
+	"anjovisk/fraud-detection/internal/adapter/vptree"
 	"anjovisk/fraud-detection/internal/port"
 	"anjovisk/fraud-detection/internal/usecase"
 )
@@ -156,6 +163,11 @@ func loadNormalization(path string, logger *zap.Logger) normalizationConfig {
 //     run preprocess with BUILD_IVF=true). IVF_NPROBE controls recall vs speed.
 //   - "vamana": approximate Vamana graph; requires references.vamana (Fatal if absent —
 //     run preprocess with BUILD_VAMANA=true). VAMANA_L controls beam width at query time.
+//   - "partition": exact brute-force partitioned by (last_tx_null × is_online × card_present);
+//     reads references.bin only — no separate index file required. ~3.2× faster than brute.
+//   - "vptree": exact VP-Tree search within each partition bin; same routing as "partition"
+//     but with triangle-inequality pruning inside each bin. Built at startup from references.bin.
+//     Faster than "partition" when intrinsic dimensionality within bins enables effective pruning.
 //   - anything else (including "brute" or ""): exact brute-force O(N) scan.
 func buildNeighborFinder(kind string, logger *zap.Logger) port.NeighborFinder {
 	const refsPath = "resources/references.bin"
@@ -216,6 +228,25 @@ func buildNeighborFinder(kind string, logger *zap.Logger) port.NeighborFinder {
 			logger.Fatal("failed to load Vamana index — run preprocess with BUILD_VAMANA=true",
 				zap.Error(err),
 			)
+		}
+		return s
+	case "partition":
+		logger.Info("neighbor finder: partition-brute (exact within partition)",
+			zap.String("bin_features", "last_tx_null × is_online × card_present"),
+		)
+		s, err := partition.Open(refsPath, logger)
+		if err != nil {
+			logger.Fatal("failed to open partition index", zap.Error(err))
+		}
+		return s
+	case "vptree":
+		logger.Info("neighbor finder: VP-Tree (exact within partition)",
+			zap.String("bin_features", "last_tx_null × is_online × card_present"),
+			zap.Int("leaf_size", 32),
+		)
+		s, err := vptree.Open(refsPath, logger)
+		if err != nil {
+			logger.Fatal("failed to build VP-Tree index", zap.Error(err))
 		}
 		return s
 	default:
