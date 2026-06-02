@@ -254,12 +254,13 @@ func buildVamana(binPath string) {
 // buildHNSWFlat constructs a flat mmap-able HNSW index from binPath and writes it to
 // resources/references.hnswflat. Parameters are read from environment variables:
 //
-//	HNSWFLAT_M            max connections per upper-layer node (default 3, layer 0 = 2×M)
+//	HNSWFLAT_M            max connections per upper-layer node (default 3)
+//	HNSWFLAT_M0           layer-0 connections per node (default 2×M); the key recall lever
 //	HNSWFLAT_EF_BUILD     candidate-list size during construction (default 100)
 //	HNSWFLAT_REFINE       "false" to skip the second-pass refinement (default true)
 //	HNSWFLAT_SQ8          "false" to disable SQ8 quantization (default true)
 //
-// Memory at serve time (N=3M, M=3, SQ8=true): ~143 MB mmap + ~15 MB heap ≈ 158 MB RSS.
+// Memory at serve time (N=3M, M=3, M0=6, SQ8=true): ~143 MB mmap + ~15 MB heap ≈ 158 MB RSS.
 func buildHNSWFlat(binPath string) {
 	const outPath = "resources/references.hnswflat"
 
@@ -267,6 +268,12 @@ func buildHNSWFlat(binPath string) {
 	if raw := os.Getenv("HNSWFLAT_M"); raw != "" {
 		if n, err := strconv.Atoi(raw); err == nil && n > 0 {
 			M = n
+		}
+	}
+	M0 := hnswflat.DefaultM0
+	if raw := os.Getenv("HNSWFLAT_M0"); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil && n > 0 {
+			M0 = n
 		}
 	}
 	efBuild := hnswflat.DefaultEfConstruction
@@ -284,12 +291,12 @@ func buildHNSWFlat(binPath string) {
 		sq8 = false
 	}
 
-	log.Printf("building HNSW-flat index (M=%d, ef_build=%d, refine=%v, sq8=%v)…", M, efBuild, refine, sq8)
+	log.Printf("building HNSW-flat index (M=%d, M0=%d, ef_build=%d, refine=%v, sq8=%v)…", M, M0, efBuild, refine, sq8)
 
 	logger, _ := zap.NewProduction()
 	defer logger.Sync() //nolint:errcheck
 
-	if err := hnswflat.Build(binPath, outPath, M, efBuild, refine, sq8, logger); err != nil {
+	if err := hnswflat.Build(binPath, outPath, M, M0, efBuild, refine, sq8, logger); err != nil {
 		log.Fatalf("build HNSW-flat index: %v", err)
 	}
 	log.Printf("done: HNSW-flat index → %s", outPath)

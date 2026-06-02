@@ -41,7 +41,7 @@ func forBothModes(t *testing.T, f func(t *testing.T, sq8 bool)) {
 
 func TestHNSWFlat_SingleRef(t *testing.T) {
 	forBothModes(t, func(t *testing.T, sq8 bool) {
-		s := hnswflat.New([]hnswflat.Reference{ref(zeroVec, "legit")}, 3, 10, 20, sq8, zap.NewNop())
+		s := hnswflat.New([]hnswflat.Reference{ref(zeroVec, "legit")}, 3, 0, 10, 20, sq8, zap.NewNop())
 		labels := s.FindNearest(zeroVec, 1)
 		if len(labels) != 1 || labels[0] != "legit" {
 			t.Errorf("expected [legit], got %v", labels)
@@ -52,7 +52,7 @@ func TestHNSWFlat_SingleRef(t *testing.T) {
 func TestHNSWFlat_ChoosesNearest(t *testing.T) {
 	forBothModes(t, func(t *testing.T, sq8 bool) {
 		refs := []hnswflat.Reference{ref(zeroVec, "legit"), ref(oneVec, "fraud")}
-		s := hnswflat.New(refs, 2, 10, 20, sq8, zap.NewNop())
+		s := hnswflat.New(refs, 2, 0, 10, 20, sq8, zap.NewNop())
 		labels := s.FindNearest(nearZeroVec, 1)
 		if len(labels) != 1 || labels[0] != "legit" {
 			t.Errorf("expected [legit], got %v", labels)
@@ -66,7 +66,7 @@ func TestHNSWFlat_ReturnsExactlyK(t *testing.T) {
 		for i := range refs {
 			refs[i] = ref(zeroVec, "legit")
 		}
-		s := hnswflat.New(refs, 3, 10, 30, sq8, zap.NewNop())
+		s := hnswflat.New(refs, 3, 0, 10, 30, sq8, zap.NewNop())
 		labels := s.FindNearest(zeroVec, 5)
 		if len(labels) != 5 {
 			t.Errorf("expected 5, got %d", len(labels))
@@ -104,7 +104,7 @@ func TestHNSWFlat_BuildOpenRoundtrip(t *testing.T) {
 
 		writeBin(t, binFile, vecs, labels)
 
-		if err := hnswflat.Build(binFile, idxFile, 2, 20, false, sq8, zap.NewNop()); err != nil {
+		if err := hnswflat.Build(binFile, idxFile, 2, 0, 20, false, sq8, zap.NewNop()); err != nil {
 			t.Fatalf("Build: %v", err)
 		}
 
