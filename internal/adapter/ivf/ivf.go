@@ -20,11 +20,22 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"sync"
 
 	"go.uber.org/zap"
 
 	"anjovisk/fraud-detection/internal/domain"
 )
+
+// queryBuf holds pre-allocated scratch space for centroid selection.
+// Instances are recycled across FindNearest calls via Searcher.pool to avoid
+// the per-query heap allocation of the former indices+dists slices (~12 KB each).
+type queryBuf struct {
+	// dists holds the squared distances of the current best nprobe centroids.
+	dists []float32
+	// idxs holds the cluster index for each entry in dists.
+	idxs []int
+}
 
 // DefaultNprobe is the number of IVF clusters searched per query when IVF_NPROBE is unset.
 // With nlist=1024 and nprobe=32, roughly 3% of the dataset is searched per query,
@@ -67,6 +78,9 @@ type Searcher struct {
 	sizes []int32
 	// logger is the named zap logger injected at construction.
 	logger *zap.Logger
+	// pool recycles queryBuf instances across FindNearest calls, eliminating the
+	// per-query allocation of the centroid-search index and distance buffers.
+	pool sync.Pool
 }
 
 // Open reads a pre-built IVF index from path and returns a Searcher.
@@ -197,7 +211,7 @@ func Open(path string, nprobe int, logger *zap.Logger) (*Searcher, error) {
 		zap.Int("total_vectors", totalVecs),
 	)
 
-	return &Searcher{
+	s := &Searcher{
 		nlist:     nlist,
 		nprobe:    nprobe,
 		sq8:       sq8,
@@ -210,7 +224,23 @@ func Open(path string, nprobe int, logger *zap.Logger) (*Searcher, error) {
 		offsets:   offsets,
 		sizes:     sizes,
 		logger:    logger,
-	}, nil
+	}
+	s.initPool()
+	return s, nil
+}
+
+// initPool initialises the sync.Pool that recycles centroid-search buffers.
+// Must be called once after s.nprobe is set.
+func (s *Searcher) initPool() {
+	nprobe := s.nprobe
+	s.pool = sync.Pool{
+		New: func() any {
+			return &queryBuf{
+				dists: make([]float32, nprobe),
+				idxs:  make([]int, nprobe),
+			}
+		},
+	}
 }
 
 // FindNearest returns the labels ("fraud" or "legit") of up to k approximate nearest
@@ -231,10 +261,14 @@ func (s *Searcher) FindNearest(v domain.Vector, k int) []string {
 		query[i] = float32(f)
 	}
 
-	probeList := s.nearestClusters(query)
+	// Borrow a pre-allocated centroid buffer from the pool; return it when done.
+	buf := s.pool.Get().(*queryBuf)
+	defer s.pool.Put(buf)
+
+	s.nearestClusters(query, buf)
 
 	totalSearched := 0
-	for _, ci := range probeList {
+	for _, ci := range buf.idxs {
 		totalSearched += int(s.sizes[ci])
 	}
 	actualK := k
@@ -259,13 +293,13 @@ func (s *Searcher) FindNearest(v domain.Vector, k int) []string {
 		for d := 0; d < domain.VectorSize; d++ {
 			residual[d] = query[d] - s.sq8Min[d]
 		}
-		for _, ci := range probeList {
+		for _, ci := range buf.idxs {
 			off := int(s.offsets[ci])
 			sz := int(s.sizes[ci])
 			vecs := s.vecFlat8[off*domain.VectorSize : (off+sz)*domain.VectorSize]
 			lbls := s.labelFlat[off : off+sz]
 			for j := 0; j < sz; j++ {
-				d := sq8L2Sq(residual[:], s.sq8Scale[:], vecs[j*domain.VectorSize:])
+				d := sq8L2SqEarlyExit(residual[:], s.sq8Scale[:], vecs[j*domain.VectorSize:], worstDist)
 				if d < worstDist {
 					best[worstPos] = candidate{d, lbls[j]}
 					worstDist = best[0].dist
@@ -280,13 +314,13 @@ func (s *Searcher) FindNearest(v domain.Vector, k int) []string {
 			}
 		}
 	} else {
-		for _, ci := range probeList {
+		for _, ci := range buf.idxs {
 			off := int(s.offsets[ci])
 			sz := int(s.sizes[ci])
 			vecs := s.vecFlat32[off*domain.VectorSize : (off+sz)*domain.VectorSize]
 			lbls := s.labelFlat[off : off+sz]
 			for j := 0; j < sz; j++ {
-				d := f32L2Sq(query[:], vecs[j*domain.VectorSize:])
+				d := f32L2SqEarlyExit(query[:], vecs[j*domain.VectorSize:], worstDist)
 				if d < worstDist {
 					best[worstPos] = candidate{d, lbls[j]}
 					worstDist = best[0].dist
@@ -315,48 +349,67 @@ func (s *Searcher) FindNearest(v domain.Vector, k int) []string {
 	return out
 }
 
-// nearestClusters returns the indices of the s.nprobe centroids nearest to query
-// using L2 distance. Uses partial selection sort — with nlist=1024 and nprobe=32,
-// this is ~32K comparisons, negligible relative to the inner vector search.
-func (s *Searcher) nearestClusters(query [domain.VectorSize]float32) []int {
-	indices := make([]int, s.nlist)
-	dists := make([]float32, s.nlist)
-	for c := 0; c < s.nlist; c++ {
-		indices[c] = c
-		dists[c] = f32L2Sq(query[:], s.centroids[c*domain.VectorSize:])
+// nearestClusters fills buf with the s.nprobe centroid indices closest to query.
+//
+// Single-pass O(nlist) scan with a fixed-size worst-of-k buffer — the same approach
+// used by adapter/knn. Compared to the previous selection sort:
+//   - eliminates the per-call allocation of indices+dists slices (~12 KB)
+//   - reduces comparisons from O(nlist×nprobe) = 32K to O(nlist + nprobe×hits) ≈ 1K–5K
+//   - applies early-exit distance pruning once the buffer has nprobe candidates
+func (s *Searcher) nearestClusters(query [domain.VectorSize]float32, buf *queryBuf) {
+	best := buf.dists
+	idxs := buf.idxs
+	for i := range best {
+		best[i] = math.MaxFloat32
+		idxs[i] = i
 	}
-	for i := 0; i < s.nprobe; i++ {
-		minPos := i
-		for j := i + 1; j < s.nlist; j++ {
-			if dists[j] < dists[minPos] {
-				minPos = j
+	worstDist := float32(math.MaxFloat32)
+	worstPos := 0
+
+	for c := 0; c < s.nlist; c++ {
+		d := f32L2SqEarlyExit(query[:], s.centroids[c*domain.VectorSize:], worstDist)
+		if d < worstDist {
+			best[worstPos] = d
+			idxs[worstPos] = c
+			worstDist = best[0]
+			worstPos = 0
+			for j := 1; j < s.nprobe; j++ {
+				if best[j] > worstDist {
+					worstDist = best[j]
+					worstPos = j
+				}
 			}
 		}
-		indices[i], indices[minPos] = indices[minPos], indices[i]
-		dists[i], dists[minPos] = dists[minPos], dists[i]
 	}
-	return indices[:s.nprobe]
 }
 
-// sq8L2Sq computes the approximate squared L2 distance from a float32 query to a
-// SQ8-encoded reference vector. residual[d] = query[d] - sq8Min[d]; scale[d] maps
-// the uint8 step back to the original float range. Both slices have length VectorSize.
-func sq8L2Sq(residual, scale []float32, qvec []uint8) float32 {
-	var sum float32
-	for d := 0; d < domain.VectorSize; d++ {
-		diff := residual[d] - float32(qvec[d])*scale[d]
-		sum += diff * diff
-	}
-	return sum
-}
-
-// f32L2Sq computes the exact squared L2 distance between two float32 slices of length
-// VectorSize. Used for centroid search and for the inner vector search when sq8=false.
-func f32L2Sq(a, b []float32) float32 {
+// f32L2SqEarlyExit computes the squared L2 distance between two float32 slices,
+// aborting and returning the partial sum as soon as it reaches or exceeds threshold.
+// Used in hot paths where the partial sum can be compared against the current
+// k-th best distance to skip vectors that cannot improve the result set.
+func f32L2SqEarlyExit(a, b []float32, threshold float32) float32 {
 	var sum float32
 	for d := 0; d < domain.VectorSize; d++ {
 		diff := a[d] - b[d]
 		sum += diff * diff
+		if sum >= threshold {
+			return sum
+		}
+	}
+	return sum
+}
+
+// sq8L2SqEarlyExit computes the approximate SQ8 squared L2 distance with early exit.
+// residual[d] = query[d] - sq8Min[d]; scale[d] maps the uint8 step to the original range.
+// Aborts as soon as the partial sum reaches threshold, skipping remaining dimensions.
+func sq8L2SqEarlyExit(residual, scale []float32, qvec []uint8, threshold float32) float32 {
+	var sum float32
+	for d := 0; d < domain.VectorSize; d++ {
+		diff := residual[d] - float32(qvec[d])*scale[d]
+		sum += diff * diff
+		if sum >= threshold {
+			return sum
+		}
 	}
 	return sum
 }

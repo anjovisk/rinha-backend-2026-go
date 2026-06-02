@@ -94,7 +94,7 @@ func New(refs []Reference, nlist, nprobe int, sq8 bool, logger *zap.Logger) *Sea
 		nprobe = nlist
 	}
 
-	return &Searcher{
+	s := &Searcher{
 		nlist:     nlist,
 		nprobe:    nprobe,
 		sq8:       sq8,
@@ -108,6 +108,8 @@ func New(refs []Reference, nlist, nprobe int, sq8 bool, logger *zap.Logger) *Sea
 		sizes:     sizes,
 		logger:    logger,
 	}
+	s.initPool()
+	return s
 }
 
 // Build constructs an IVF index from the flat binary file at binPath (produced by
