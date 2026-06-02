@@ -9,8 +9,6 @@ services:
     depends_on:
       - api-1
       - api-2
-      - api-3
-      - api-4
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9999/ready"]
       interval: 30s
@@ -23,8 +21,8 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.14"
-          memory: "30MB"
+          cpus: "0.20"
+          memory: "50MB"
 
   api-1:
     build:
@@ -55,13 +53,13 @@ services:
       - IVF_NPROBE=${IVF_NPROBE:-32}
       - VAMANA_L=${VAMANA_L:-64}
       - HNSWFLAT_EF=${HNSWFLAT_EF:-50}
-      - GOMEMLIMIT=${GOMEMLIMIT:-15MiB}
+      - GOMEMLIMIT=${GOMEMLIMIT:-135MiB}
       - GOMAXPROCS=1
     deploy:
       resources:
         limits:
-          cpus: "0.22"
-          memory: "80MB"
+          cpus: "0.40"
+          memory: "155MB"
 
   api-2:
     build:
@@ -92,87 +90,13 @@ services:
       - IVF_NPROBE=${IVF_NPROBE:-32}
       - VAMANA_L=${VAMANA_L:-64}
       - HNSWFLAT_EF=${HNSWFLAT_EF:-50}
-      - GOMEMLIMIT=${GOMEMLIMIT:-15MiB}
+      - GOMEMLIMIT=${GOMEMLIMIT:-135MiB}
       - GOMAXPROCS=1
     deploy:
       resources:
         limits:
-          cpus: "0.22"
-          memory: "80MB"
-
-  api-3:
-    build:
-      context: .
-      args:
-        BUILD_HNSW: ${BUILD_HNSW:-false}
-        BUILD_IVF: ${BUILD_IVF:-false}
-        IVF_NLIST: ${IVF_NLIST:-1024}
-        IVF_SQ8: ${IVF_SQ8:-true}
-        BUILD_VAMANA: ${BUILD_VAMANA:-false}
-        VAMANA_R: ${VAMANA_R:-16}
-        VAMANA_BUILD_L: ${VAMANA_BUILD_L:-0}
-        VAMANA_ALPHA: ${VAMANA_ALPHA:-1.2}
-        VAMANA_SQ8: ${VAMANA_SQ8:-true}
-        BUILD_HNSWFLAT: ${BUILD_HNSWFLAT:-false}
-        HNSWFLAT_M: ${HNSWFLAT_M:-3}
-        HNSWFLAT_EF_BUILD: ${HNSWFLAT_EF_BUILD:-100}
-        HNSWFLAT_SQ8: ${HNSWFLAT_SQ8:-true}
-    platform: linux/amd64
-    ports:
-      - "8082:8080"
-    networks:
-      - api-network
-    restart: unless-stopped
-    environment:
-      - LOG_LEVEL=${LOG_LEVEL:-error}
-      - VECTOR_SEARCHER=${VECTOR_SEARCHER:-brute}
-      - IVF_NPROBE=${IVF_NPROBE:-32}
-      - VAMANA_L=${VAMANA_L:-64}
-      - HNSWFLAT_EF=${HNSWFLAT_EF:-50}
-      - GOMEMLIMIT=${GOMEMLIMIT:-15MiB}
-      - GOMAXPROCS=1
-    deploy:
-      resources:
-        limits:
-          cpus: "0.22"
-          memory: "80MB"
-
-  api-4:
-    build:
-      context: .
-      args:
-        BUILD_HNSW: ${BUILD_HNSW:-false}
-        BUILD_IVF: ${BUILD_IVF:-false}
-        IVF_NLIST: ${IVF_NLIST:-1024}
-        IVF_SQ8: ${IVF_SQ8:-true}
-        BUILD_VAMANA: ${BUILD_VAMANA:-false}
-        VAMANA_R: ${VAMANA_R:-16}
-        VAMANA_BUILD_L: ${VAMANA_BUILD_L:-0}
-        VAMANA_ALPHA: ${VAMANA_ALPHA:-1.2}
-        VAMANA_SQ8: ${VAMANA_SQ8:-true}
-        BUILD_HNSWFLAT: ${BUILD_HNSWFLAT:-false}
-        HNSWFLAT_M: ${HNSWFLAT_M:-3}
-        HNSWFLAT_EF_BUILD: ${HNSWFLAT_EF_BUILD:-100}
-        HNSWFLAT_SQ8: ${HNSWFLAT_SQ8:-true}
-    platform: linux/amd64
-    ports:
-      - "8083:8080"
-    networks:
-      - api-network
-    restart: unless-stopped
-    environment:
-      - LOG_LEVEL=${LOG_LEVEL:-error}
-      - VECTOR_SEARCHER=${VECTOR_SEARCHER:-brute}
-      - IVF_NPROBE=${IVF_NPROBE:-32}
-      - VAMANA_L=${VAMANA_L:-64}
-      - HNSWFLAT_EF=${HNSWFLAT_EF:-50}
-      - GOMEMLIMIT=${GOMEMLIMIT:-15MiB}
-      - GOMAXPROCS=1
-    deploy:
-      resources:
-        limits:
-          cpus: "0.22"
-          memory: "80MB"
+          cpus: "0.40"
+          memory: "155MB"
 
 networks:
   api-network:
