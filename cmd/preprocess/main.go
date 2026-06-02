@@ -24,6 +24,7 @@ import (
 	"go.uber.org/zap"
 
 	"anjovisk/fraud-detection/internal/adapter/hnsw"
+	"anjovisk/fraud-detection/internal/adapter/hnswflat"
 	"anjovisk/fraud-detection/internal/adapter/ivf"
 	"anjovisk/fraud-detection/internal/adapter/vamana"
 	"anjovisk/fraud-detection/internal/domain"
@@ -145,6 +146,12 @@ func main() {
 	} else {
 		log.Printf("skipping Vamana index build (BUILD_VAMANA != true)")
 	}
+
+	if os.Getenv("BUILD_HNSWFLAT") == "true" {
+		buildHNSWFlat(outPath)
+	} else {
+		log.Printf("skipping HNSW-flat index build (BUILD_HNSWFLAT != true)")
+	}
 }
 
 // buildHNSW builds an HNSW approximate index from binPath and exports it to
@@ -242,6 +249,45 @@ func buildVamana(binPath string) {
 	}
 
 	log.Printf("done: Vamana index → %s", vamanaPath)
+}
+
+// buildHNSWFlat constructs a flat mmap-able HNSW index from binPath and writes it to
+// resources/references.hnswflat. Parameters are read from environment variables:
+//
+//	HNSWFLAT_M            max connections per upper-layer node (default 3, layer 0 = 2×M)
+//	HNSWFLAT_EF_BUILD     candidate-list size during construction (default 100)
+//	HNSWFLAT_SQ8          "false" to disable SQ8 quantization (default true)
+//
+// Memory at serve time (N=3M, M=3, SQ8=true): ~143 MB mmap + ~15 MB heap ≈ 158 MB RSS.
+func buildHNSWFlat(binPath string) {
+	const outPath = "resources/references.hnswflat"
+
+	M := hnswflat.DefaultM
+	if raw := os.Getenv("HNSWFLAT_M"); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil && n > 0 {
+			M = n
+		}
+	}
+	efBuild := hnswflat.DefaultEfConstruction
+	if raw := os.Getenv("HNSWFLAT_EF_BUILD"); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil && n > 0 {
+			efBuild = n
+		}
+	}
+	sq8 := hnswflat.DefaultSQ8
+	if os.Getenv("HNSWFLAT_SQ8") == "false" {
+		sq8 = false
+	}
+
+	log.Printf("building HNSW-flat index (M=%d, ef_build=%d, sq8=%v)…", M, efBuild, sq8)
+
+	logger, _ := zap.NewProduction()
+	defer logger.Sync() //nolint:errcheck
+
+	if err := hnswflat.Build(binPath, outPath, M, efBuild, sq8, logger); err != nil {
+		log.Fatalf("build HNSW-flat index: %v", err)
+	}
+	log.Printf("done: HNSW-flat index → %s", outPath)
 }
 
 // isFiniteF32 reports whether f is neither NaN nor infinite.
