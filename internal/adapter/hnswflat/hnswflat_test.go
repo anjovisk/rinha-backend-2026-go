@@ -104,7 +104,7 @@ func TestHNSWFlat_BuildOpenRoundtrip(t *testing.T) {
 
 		writeBin(t, binFile, vecs, labels)
 
-		if err := hnswflat.Build(binFile, idxFile, 2, 20, sq8, zap.NewNop()); err != nil {
+		if err := hnswflat.Build(binFile, idxFile, 2, 20, false, sq8, zap.NewNop()); err != nil {
 			t.Fatalf("Build: %v", err)
 		}
 

@@ -256,6 +256,7 @@ func buildVamana(binPath string) {
 //
 //	HNSWFLAT_M            max connections per upper-layer node (default 3, layer 0 = 2×M)
 //	HNSWFLAT_EF_BUILD     candidate-list size during construction (default 100)
+//	HNSWFLAT_REFINE       "false" to skip the second-pass refinement (default true)
 //	HNSWFLAT_SQ8          "false" to disable SQ8 quantization (default true)
 //
 // Memory at serve time (N=3M, M=3, SQ8=true): ~143 MB mmap + ~15 MB heap ≈ 158 MB RSS.
@@ -274,17 +275,21 @@ func buildHNSWFlat(binPath string) {
 			efBuild = n
 		}
 	}
+	refine := hnswflat.DefaultRefine
+	if os.Getenv("HNSWFLAT_REFINE") == "false" {
+		refine = false
+	}
 	sq8 := hnswflat.DefaultSQ8
 	if os.Getenv("HNSWFLAT_SQ8") == "false" {
 		sq8 = false
 	}
 
-	log.Printf("building HNSW-flat index (M=%d, ef_build=%d, sq8=%v)…", M, efBuild, sq8)
+	log.Printf("building HNSW-flat index (M=%d, ef_build=%d, refine=%v, sq8=%v)…", M, efBuild, refine, sq8)
 
 	logger, _ := zap.NewProduction()
 	defer logger.Sync() //nolint:errcheck
 
-	if err := hnswflat.Build(binPath, outPath, M, efBuild, sq8, logger); err != nil {
+	if err := hnswflat.Build(binPath, outPath, M, efBuild, refine, sq8, logger); err != nil {
 		log.Fatalf("build HNSW-flat index: %v", err)
 	}
 	log.Printf("done: HNSW-flat index → %s", outPath)

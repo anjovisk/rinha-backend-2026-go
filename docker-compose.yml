@@ -40,6 +40,7 @@ services:
         BUILD_HNSWFLAT: ${BUILD_HNSWFLAT:-false}
         HNSWFLAT_M: ${HNSWFLAT_M:-3}
         HNSWFLAT_EF_BUILD: ${HNSWFLAT_EF_BUILD:-100}
+        HNSWFLAT_REFINE: ${HNSWFLAT_REFINE:-true}
         HNSWFLAT_SQ8: ${HNSWFLAT_SQ8:-true}
     platform: linux/amd64
     ports:
@@ -77,6 +78,7 @@ services:
         BUILD_HNSWFLAT: ${BUILD_HNSWFLAT:-false}
         HNSWFLAT_M: ${HNSWFLAT_M:-3}
         HNSWFLAT_EF_BUILD: ${HNSWFLAT_EF_BUILD:-100}
+        HNSWFLAT_REFINE: ${HNSWFLAT_REFINE:-true}
         HNSWFLAT_SQ8: ${HNSWFLAT_SQ8:-true}
     platform: linux/amd64
     ports:
