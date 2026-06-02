@@ -190,7 +190,11 @@ func buildGraph(vecs []float32, rawLabels []uint8, n, M, efConstruction int, log
 	levels := make([]uint8, n)
 	maxLevel := 0
 	for i := 0; i < n; i++ {
-		l := int(math.Floor(-math.Log(rand.Float64()) * mL))
+		r := rand.Float64()
+		if r == 0 {
+			r = 1e-300 // evita -log(0) = +Inf → nível lixo
+		}
+		l := int(math.Floor(-math.Log(r) * mL))
 		if l > 15 {
 			l = 15 // cap at uint8 max reasonable value
 		}
@@ -316,18 +320,37 @@ func buildGraph(vecs []float32, rawLabels []uint8, n, M, efConstruction int, log
 						vis[c.node] = false
 					}
 
-					// Select neighbors (heuristic: skip nodes "shadowed" by closer ones).
-					neighbors := selectNeighborsHeuristic(qVec, candidates, M*2, vecs)
-					if layer > 0 {
-						neighbors = selectNeighborsHeuristic(qVec, candidates, M, vecs)
-					}
 					maxDeg := 2 * M
+					targetM := 2 * M
 					if layer > 0 {
 						maxDeg = M
+						targetM = M
 					}
 
-					// Add bidirectional connections.
+					// For upper layers, filter candidates to only nodes that exist at
+					// this layer. Using wrong-level nodes wastes connection slots and
+					// produces unreachable references that degrade recall.
+					validCandidates := candidates
+					if layer > 0 {
+						filtered := make([]hItem, 0, len(candidates))
+						for _, c := range candidates {
+							if int(levels[c.node]) >= layer {
+								filtered = append(filtered, c)
+							}
+						}
+						validCandidates = filtered
+					}
+
+					// Select neighbors (heuristic: prefer nodes not shadowed by closer ones).
+					neighbors := selectNeighborsHeuristic(qVec, validCandidates, targetM, vecs)
+
+					// Add bidirectional connections. Guard: only connect to nodes that
+					// actually exist at this layer; wrong-level nodes must be skipped.
 					for _, nb := range neighbors {
+						if layer > 0 && int(levels[nb.node]) < layer {
+							continue
+						}
+
 						sm.Lock(q)
 						addConn(l0adj, upperBuild, &upperMu, q, nb.node, layer, M)
 						sm.Unlock(q)

@@ -1,0 +1,45 @@
+{
+  "expected": {
+    "total": 54100,
+    "fraud_count": 23959,
+    "legit_count": 30141,
+    "fraud_rate": 0.4429,
+    "legit_rate": 0.5571,
+    "edge_case_count": 645,
+    "edge_case_rate": 0.0119
+  },
+  "p99": "0.91ms",
+  "scoring": {
+    "breakdown": {
+      "false_positive_detections": 238,
+      "false_negative_detections": 719,
+      "true_positive_detections": 23223,
+      "true_negative_detections": 29879,
+      "http_errors": 0
+    },
+    "failure_rate": "1.77%",
+    "weighted_errors_E": 2395,
+    "error_rate_epsilon": 0.044303,
+    "p99_score": {
+      "value": 3000,
+      "cut_triggered": false
+    },
+    "detection_score": {
+      "value": 339.72,
+      "rate_component": 1353.56,
+      "absolute_penalty": -1013.85,
+      "cut_triggered": false
+    },
+    "final_score": 3339.72,
+    "raw": {
+      "p99_ms": 0.9062873999999996,
+      "failure_rate": 0.01770288018646294,
+      "error_rate_epsilon": 0.04430344623466953,
+      "p99_score": 3000,
+      "detection_score": 339.71644585841625,
+      "rate_component": 1353.5624899735983,
+      "absolute_penalty": -1013.846044115182,
+      "final_score": 3339.716445858416
+    }
+  }
+}
