@@ -419,36 +419,56 @@ A eficácia da poda depende da **dimensionalidade intrínseca** dos dados em cad
 
 #### Ranqueamento de configurações IVF
 
-A memória do índice depende de `IVF_SQ8`: **~45 MB com SQ8** (padrão) ou **~168 MB sem SQ8**. O tradeoff principal continua sendo latência de busca vs recall, controlado por `IVF_NLIST` e `IVF_NPROBE`. A tabela abaixo assume `IVF_SQ8=true` (SQ8 ativo). A tabela abaixo mostra as configurações mais relevantes para a base de N = 3.000.000 vetores com D = 14 dimensões.
+Com o fix de mmap (`ivf/ivf.go`), `vecFlat8` e `labelFlat` são fatiados diretamente da região mmapeada (`MAP_SHARED`) sem cópia para o heap Go. O perfil de memória por instância passa a ser **~43 MB page cache + ~15 MB heap = ~58 MB RSS** — fora do controle do GC, eliminando a degradação de CPU ao longo do teste. Com `IVF_SQ8=false` (~168 MB heap), o limite de 100 MB por instância é excedido; essa opção só é viável na configuração de 2 instâncias com limite de 165 MB.
 
-| # | `IVF_NLIST` | `IVF_NPROBE` | Vetores/query | % do dataset | Speedup vs brute | Recall k=5 (est.) | Build K-means |
-|---|-------------|--------------|:-------------:|:------------:|:----------------:|:-----------------:|:-------------:|
-| 1 | 2048 | 16 | 23.437 | 0,78% | ~128× | ~76% | ~60 s |
-| 2 | 1024 | 16 | 46.875 | 1,56% | ~64× | ~81% | ~30 s |
-| 3 | 2048 | 32 | 46.875 | 1,56% | ~64× | ~86% | ~60 s |
-| 4 | 1024 | 32 | 93.750 | 3,13% | ~32× | ~90% | ~30 s |
-| **5 ★** | **2048** | **64** | **93.750** | **3,13%** | **~32×** | **~94%** | **~60 s** |
-| 6 | 1024 | 64 | 187.500 | 6,25% | ~16× | ~96% | ~30 s |
-| 7 | 2048 | 128 | 187.500 | 6,25% | ~16× | ~98% | ~60 s |
-| 8 | 4096 | 128 | 93.750 | 3,13% | ~32× | ~97% | ~120 s |
+A tabela cobre as combinações mais relevantes para N = 3.000.000, D = 14, `IVF_SQ8=true`. A **latência estimada** soma scan de centroides + scan de vetores SQ8 + overhead HTTP/JSON (~250 µs base), com ~2 ns/vetor para o scan inner loop.
 
-**Recall**: fração estimada das queries em que o conjunto exato de top-5 vizinhos é recuperado. Para o mesmo percentual de dataset pesquisado, `nlist` maior produz particionamento mais fino e recall ligeiramente maior (configs #5 vs #4, e #8 vs #7). Valores dependem da distribuição real dos dados — valide com benchmark local antes de escolher a config final.
+| # | `IVF_NLIST` | `IVF_NPROBE` | Vetores/query | % dataset | Speedup vs brute | Recall k=5 (est.) | Latência est. | Build K-means |
+|---|-------------|--------------|:-------------:|:---------:|:----------------:|:-----------------:|:-------------:|:-------------:|
+| 1 | 4096 | 16 | ~11.700 | 0,39% | ~256× | ~58% | ~275 µs | ~120 s |
+| 2 | 4096 | 32 | ~23.400 | 0,78% | ~128× | ~68% | ~297 µs | ~120 s |
+| 3 | 2048 | 16 | ~23.400 | 0,78% | ~128× | ~74% | ~297 µs | ~60 s |
+| 4 | 4096 | 64 | ~46.900 | 1,56% | ~64× | ~80% | ~344 µs | ~120 s |
+| 5 | 2048 | 32 | ~46.900 | 1,56% | ~64× | ~86% | ~344 µs | ~60 s |
+| 6 | 1024 | 16 | ~46.900 | 1,56% | ~64× | ~80% | ~344 µs | ~30 s |
+| 7 | 512 | 8 | ~46.900 | 1,56% | ~64× | ~70% | ~344 µs | ~15 s |
+| 8 | 4096 | 128 | ~93.700 | 3,13% | ~32× | ~91% | ~437 µs | ~120 s |
+| **9 ★** | **2048** | **64** | **~93.700** | **3,13%** | **~32×** | **~94%** | **~437 µs** | **~60 s** |
+| 10 | 1024 | 32 | ~93.700 | 3,13% | ~32× | ~90% | ~437 µs | ~30 s |
+| 11 | 512 | 16 | ~93.700 | 3,13% | ~32× | ~80% | ~437 µs | ~15 s |
+| 12 | 4096 | 256 | ~187.500 | 6,25% | ~16× | ~97% | ~625 µs | ~120 s |
+| 13 | 2048 | 128 | ~187.500 | 6,25% | ~16× | ~97% | ~625 µs | ~60 s |
+| 14 | 1024 | 64 | ~187.500 | 6,25% | ~16× | ~96% | ~625 µs | ~30 s |
+| 15 | 512 | 32 | ~187.500 | 6,25% | ~16× | ~87% | ~625 µs | ~15 s |
+| 16 | 4096 | 512 | ~375.000 | 12,5% | ~8× | ~99% | ~1000 µs | ~120 s |
+| 17 | 2048 | 256 | ~375.000 | 12,5% | ~8× | ~99% | ~1000 µs | ~60 s |
+| 18 | 1024 | 128 | ~375.000 | 12,5% | ~8× | ~98% | ~1000 µs | ~30 s |
+| 19 | 512 | 64 | ~375.000 | 12,5% | ~8× | ~90% | ~1000 µs | ~15 s |
+| 20 | 1024 | 256 | ~750.000 | 25,0% | ~4× | ~99,5% | ~1750 µs | ~30 s |
+| 21 | 2048 | 512 | ~750.000 | 25,0% | ~4× | ~99,5% | ~1750 µs | ~60 s |
 
-**Build K-means**: estimativa para 8 CPUs com convergência antes de 30 iterações; em hardware de build com mais núcleos o tempo cai proporcionalmente.
+**Recall:** fração estimada de queries em que o top-5 exato é recuperado. Para mesmo % do dataset, `nlist` maior produz particionamento mais fino → recall ligeiramente superior (ex.: #8 vs #10, #5 vs #6). Com D=14 (dimensionalidade baixa), clusters K-means são mais coesos que em datasets de alta dimensão — as estimativas tendem a ser otimistas; valide com benchmark local.
+
+**nlist=512 (configs #7, #11, #15, #19):** build muito rápido (~15 s), útil para iteração; recall inferior ao equivalente de nlist=1024 ou 2048 por clusters menos coesos. Prefira nlist=1024 em produção quando o tempo de build permitir.
+
+**Build K-means:** estimativa para 8 CPUs com convergência antes de 30 iterações; escala inversamente com CPUs disponíveis.
 
 **Análise por critério da competição:**
 
 | Critério | Config | Justificativa |
 |----------|--------|---------------|
-| Menor latência | #1 nlist=2048 / nprobe=16 | ~128× vs brute; pesquisa 23K vetores por query |
-| Melhor recall | #7 nlist=2048 / nprobe=128 | ~98%; FN têm peso 3 — perder fraudes custa mais que falsos alarmes |
-| Menor uso de CPU por query | #1 nlist=2048 / nprobe=16 | Libera mais headroom para requests concorrentes |
-| **Melhor balanço geral ★** | **#5 nlist=2048 / nprobe=64** | **~32× speedup + ~94% recall; seguro contra o corte de detecção** |
-| Build mais rápido | #2–#4 nlist=1024 | Metade do tempo de K-means vs nlist=2048 |
+| Menor latência absoluta | #1 nlist=4096/nprobe=16 | ~256× vs brute; ~275 µs; recall ~58% — risco de corte de detecção |
+| Menor latência com recall seguro (≥88%) | #8 nlist=4096/nprobe=128 | ~32×; ~437 µs; recall ~91% |
+| Maior recall mantendo p99 ≤ 1 ms | #16–#18 | 12,5% do dataset; recall ~98–99%; latência ~1000 µs |
+| Melhor recall absoluto | #20/#21 | ~99,5%; p99 ~1750 µs — acima do limiar de 1 ms para `p99_score` máximo |
+| Build mais rápido com recall aceitável | #10/#11 nlist≤1024 | ≤30 s de build; recall ≥80–90% |
+| **Melhor balanço geral ★** | **#9 nlist=2048/nprobe=64** | **~32×; recall ~94%; ~437 µs; seguro contra o corte de detecção** |
 
-> **Corte de detecção:** erros de detecção (FP + FN + HTTP 5xx) acima de 15% zeram a `detection_score`. Com recall ~94%, aproximadamente 6% das queries retornam um top-5 diferente do exato — mas como `fraud_score` é discreto em passos de 0,2 (inteiros/5), a maioria dessas divergências não altera a decisão final. Configurações com recall abaixo de ~88% (configs #1 e #2) elevam o risco de cruzar o limiar, especialmente em transações borderline com score próximo de 0,6.
+> **Corte de detecção:** erros (FP + FN + HTTP 5xx) acima de 15% zeram o `detection_score`. Com recall ~94%, ~6% das queries retornam um top-5 diferente do exato — mas como `fraud_score` é discreto em passos de 0,2 (inteiros/5), a maioria dessas divergências não altera a decisão final. Configs com recall abaixo de ~88% (linhas #1–#7) elevam o risco em transações borderline com score próximo de 0,6.
 
-> **Latência**: mesmo a config #7 (187.500 vetores × 14 uint8 ops) opera com folga abaixo de 1 ms — a busca não é o gargalo. O que diferencia as configs na prática é a pressão de CPU sob carga concorrente, não a latência por query individual.
+> **Limiar p99 = 1 ms:** configs até #15 (6,25% do dataset, ~625 µs) operam com folga. Configs #16–#19 (12,5%, ~1000 µs) estão no limite — o scan de vetores sozinho consome ~750 µs, deixando ~250 µs de margem para HTTP e JSON. Configs #20–#21 (25%, ~1750 µs) ultrapassam consistentemente 1 ms; escolha-as apenas quando o ganho de recall justificar a perda em `p99_score`.
+
+> **Impacto do nlist no recall a % fixo:** para 3,13% do dataset escaneado, o recall varia de ~80% (nlist=512) a ~94% (nlist=2048) a ~91% (nlist=4096). O ponto ótimo é nlist=2048 — clusters mais coesos que nlist=512/1024, sem o custo de build de nlist=4096.
 
 ### Rodar a aplicação
 

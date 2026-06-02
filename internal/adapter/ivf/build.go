@@ -182,7 +182,7 @@ func Build(binPath, outPath string, nlist int, sq8 bool, logger *zap.Logger) err
 
 	logger.Info("inverted lists built", zap.Int("clusters", nlist))
 
-	if err := writeIVF(outPath, nlist, sq8, sq8Min, sq8Scale, centroids, offsets, sizes, vecFlat8, vecFlat32, labelFlat); err != nil {
+	if err := writeIVF(outPath, nlist, sq8, sq8Min, sq8Scale, centroids, sizes, vecFlat8, vecFlat32, labelFlat); err != nil {
 		return err
 	}
 
@@ -380,10 +380,11 @@ func buildInvertedListsF32(vecs []float32, labels []uint8, assignments []int32, 
 }
 
 // writeIVF serialises all IVF index components to outPath using a 4 MB buffered writer.
-// The binary format is described in Open's doc comment.
+// The binary format is described in Open's doc comment (flat layout, flagFlat always set).
+// offsets is no longer stored in the file — Open recomputes it from sizes at load time.
 func writeIVF(outPath string, nlist int, sq8 bool,
 	sq8Min, sq8Scale [domain.VectorSize]float32,
-	centroids []float32, offsets, sizes []int32,
+	centroids []float32, sizes []int32,
 	vecFlat8 []uint8, vecFlat32 []float32,
 	labelFlat []uint8) error {
 
@@ -399,9 +400,12 @@ func writeIVF(outPath string, nlist int, sq8 bool,
 	writeU32 := func(v uint32) { binary.LittleEndian.PutUint32(u32[:], v); w.Write(u32[:]) } //nolint:errcheck
 	writeF32 := func(v float32) { writeU32(math.Float32bits(v)) }
 
-	writeU32(uint32(nlist))
+	n := len(labelFlat)
 
-	var flags uint8
+	writeU32(uint32(nlist))
+	writeU32(uint32(n))
+
+	flags := flagFlat
 	if sq8 {
 		flags |= flagSQ8
 	}
@@ -420,19 +424,19 @@ func writeIVF(outPath string, nlist int, sq8 bool,
 		writeF32(v)
 	}
 
-	for c := 0; c < nlist; c++ {
-		sz := int(sizes[c])
+	for _, sz := range sizes {
 		writeU32(uint32(sz))
-		off := int(offsets[c])
-		if sq8 {
-			w.Write(vecFlat8[off*domain.VectorSize : (off+sz)*domain.VectorSize]) //nolint:errcheck
-		} else {
-			for _, v := range vecFlat32[off*domain.VectorSize : (off+sz)*domain.VectorSize] {
-				writeF32(v)
-			}
-		}
-		w.Write(labelFlat[off : off+sz]) //nolint:errcheck
 	}
+
+	if sq8 {
+		w.Write(vecFlat8) //nolint:errcheck
+	} else {
+		for _, v := range vecFlat32 {
+			writeF32(v)
+		}
+	}
+
+	w.Write(labelFlat) //nolint:errcheck
 
 	if err := w.Flush(); err != nil {
 		return fmt.Errorf("flush %s: %w", outPath, err)
