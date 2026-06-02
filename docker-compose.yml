@@ -39,6 +39,7 @@ services:
         VAMANA_SQ8: ${VAMANA_SQ8:-true}
         BUILD_HNSWFLAT: ${BUILD_HNSWFLAT:-false}
         HNSWFLAT_M: ${HNSWFLAT_M:-3}
+        HNSWFLAT_M0: ${HNSWFLAT_M0:-0}
         HNSWFLAT_EF_BUILD: ${HNSWFLAT_EF_BUILD:-100}
         HNSWFLAT_REFINE: ${HNSWFLAT_REFINE:-true}
         HNSWFLAT_SQ8: ${HNSWFLAT_SQ8:-true}
@@ -60,7 +61,7 @@ services:
       resources:
         limits:
           cpus: "0.40"
-          memory: "155MB"
+          memory: "1155MB"
 
   api-2:
     build:
@@ -77,6 +78,7 @@ services:
         VAMANA_SQ8: ${VAMANA_SQ8:-true}
         BUILD_HNSWFLAT: ${BUILD_HNSWFLAT:-false}
         HNSWFLAT_M: ${HNSWFLAT_M:-3}
+        HNSWFLAT_M0: ${HNSWFLAT_M0:-0}
         HNSWFLAT_EF_BUILD: ${HNSWFLAT_EF_BUILD:-100}
         HNSWFLAT_REFINE: ${HNSWFLAT_REFINE:-true}
         HNSWFLAT_SQ8: ${HNSWFLAT_SQ8:-true}
@@ -98,7 +100,7 @@ services:
       resources:
         limits:
           cpus: "0.40"
-          memory: "155MB"
+          memory: "1155MB"
 
 networks:
   api-network:

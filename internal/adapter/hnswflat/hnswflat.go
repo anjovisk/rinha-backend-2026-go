@@ -30,9 +30,14 @@ import (
 )
 
 // DefaultM is the maximum number of bidirectional connections per node at upper layers.
-// Layer 0 uses 2×M connections. M=3 keeps the total file ~143 MB for 3M vectors (SQ8),
-// fitting within the 165 MB Docker budget. Raise to 4 for ~166 MB with better recall.
+// Layer 0 uses DefaultM0 connections (default 2×M). M=3 with M0=6 gives ~143 MB mmap.
 const DefaultM = 3
+
+// DefaultM0 is the default layer-0 connection degree.
+// Decoupled from M so layer-0 (recall-critical) and upper layers (navigation-only)
+// can be tuned independently. Within 165 MB budget, M0=6 (=2×M) is the maximum for M=3.
+// Higher values require adjusting the Docker memory limit accordingly.
+const DefaultM0 = 2 * DefaultM
 
 // DefaultEfSearch is the size of the dynamic candidate list during graph traversal.
 // Higher values improve recall at the cost of latency. Must be ≥ k.
@@ -54,12 +59,12 @@ type Searcher struct {
 	vecsF32  []float32 // [N × VectorSize] float32 vectors; nil when sq8=true
 	labels   []uint8   // [N]
 	levels   []uint8  // [N] highest layer for each node (0 = layer-0 only)
-	l0adj    []uint32 // [N × 2M] layer-0 adjacency; emptySlot = unused
+	l0adj    []uint32 // [N × M0] layer-0 adjacency; emptySlot = unused
 	upperIDs []uint32 // sorted node IDs that appear in layer 1+
 	upperOff []uint32 // [upper_n+1] CSR offsets into upperAdj
 	upperAdj []uint32 // packed connections for all upper-layer nodes
 
-	n, m, l  int     // entry count, max degree, number of layers
+	n, m, m0, l int  // entry count, upper-layer degree, layer-0 degree, number of layers
 	entry    uint32  // entry-point node (at the highest layer)
 	efSearch int
 	sq8      bool
@@ -131,7 +136,10 @@ func Open(path string, efSearch int, logger *zap.Logger) (*Searcher, error) {
 	entry := readU32()
 	upperN := int(readU32())
 	flags := readU32()
-	_ = readU32() // reserved
+	m0 := int(readU32()) // layer-0 degree (was reserved=0 in older files)
+	if m0 == 0 {
+		m0 = 2 * m // backward compat: old files used 2×M implicitly
+	}
 
 	sq8 := flags&flagSQ8 != 0
 	var sq8Min, sq8Scale [domain.VectorSize]float32
@@ -177,13 +185,13 @@ func Open(path string, efSearch int, logger *zap.Logger) (*Searcher, error) {
 		p += 4 - rem
 	}
 
-	l0Size := n * 2 * m * 4
+	l0Size := n * m0 * 4
 	if p+l0Size > fileSize {
 		_ = syscall.Munmap(data)
 		return nil, fmt.Errorf("%s: truncated at layer-0 adjacency", path)
 	}
 	l0ptr := (*uint32)(unsafe.Pointer(&data[p]))
-	l0adj := unsafe.Slice(l0ptr, n*2*m)
+	l0adj := unsafe.Slice(l0ptr, n*m0)
 	p += l0Size
 
 	upperIDsSize := upperN * 4
@@ -218,6 +226,7 @@ func Open(path string, efSearch int, logger *zap.Logger) (*Searcher, error) {
 	logger.Info("hnswflat index loaded",
 		zap.Int("n", n),
 		zap.Int("M", m),
+		zap.Int("M0", m0),
 		zap.Int("layers", l),
 		zap.Bool("sq8", sq8),
 		zap.Int("ef_search", efSearch),
@@ -234,6 +243,7 @@ func Open(path string, efSearch int, logger *zap.Logger) (*Searcher, error) {
 		upperAdj: upperAdj,
 		n:        n,
 		m:        m,
+		m0:       m0,
 		l:        l,
 		entry:    entry,
 		efSearch: efSearch,
@@ -347,8 +357,8 @@ func (s *Searcher) beamSearchL0(residual, query [domain.VectorSize]float32, entr
 		if len(results) >= ef && c.dist > results[0].dist {
 			break
 		}
-		base := int(c.node) * 2 * s.m
-		for j := 0; j < 2*s.m; j++ {
+		base := int(c.node) * s.m0
+		for j := 0; j < s.m0; j++ {
 			nb := s.l0adj[base+j]
 			if nb == emptySlot || vis[nb] {
 				continue

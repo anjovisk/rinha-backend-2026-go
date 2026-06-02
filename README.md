@@ -224,13 +224,22 @@ BUILD_VAMANA=true VAMANA_R=8 go run ./cmd/preprocess
 # Vamana com alpha maior (mais arestas de longo alcance, melhor recall em datasets irregulares)
 BUILD_VAMANA=true VAMANA_ALPHA=1.4 go run ./cmd/preprocess
 
-# HNSW flat M=3 SQ8 com refinamento (padrão — ~158 MB RSS, ~10–20 min em 8 CPUs)
+# HNSW flat M=3 M0=6 SQ8 com refinamento (padrão — ~158 MB RSS, 2 instâncias em 165 MB)
 BUILD_HNSWFLAT=true go run ./cmd/preprocess
 
 # HNSW flat sem refinamento (~5–10 min, recall ~2–4 pp menor)
 BUILD_HNSWFLAT=true HNSWFLAT_REFINE=false go run ./cmd/preprocess
 
-# HNSW flat M=4 SQ8 (~166 MB mmap, excede o limite de 165 MB/instância)
+# HNSW flat M0=7 — +1 pp recall, 1 instância (RSS ~170 MB, Docker ≥ 172 MB)
+BUILD_HNSWFLAT=true HNSWFLAT_M0=7 go run ./cmd/preprocess
+
+# HNSW flat M0=8 — +1.5 pp recall, 1 instância (RSS ~182 MB, Docker ≥ 184 MB)
+BUILD_HNSWFLAT=true HNSWFLAT_M0=8 go run ./cmd/preprocess
+
+# HNSW flat M0=10 — +2.5 pp recall, 1 instância (RSS ~206 MB, Docker ≥ 208 MB)
+BUILD_HNSWFLAT=true HNSWFLAT_M0=10 go run ./cmd/preprocess
+
+# HNSW flat M=4 SQ8 (M0=8, ~166 MB mmap, requer 1 instância)
 BUILD_HNSWFLAT=true HNSWFLAT_M=4 go run ./cmd/preprocess
 
 # HNSW flat com ef_build maior (melhor qualidade do grafo, build mais lento)
@@ -272,8 +281,9 @@ O algoritmo usado para encontrar os 5 vizinhos mais próximos é controlado pela
 | `ivf` + `IVF_SQ8=false` | IVF aprox. sem SQ8 (K-means + float32) | O(nprobe·N/nlist) | < 1 s (heap) | ~168 MB heap por instância | ~96–99% (nprobe=32) |
 | `vamana` + R=16 SQ8 (padrão) | Vamana/DiskANN aprox. (grafo flat + RobustPrune) | O(L·R) ≈ O(1024) | < 1 s (mmap) | ~0 — grafo+vetores compartilhados via mmap/page cache | ~95–98% (L=64) |
 | `vamana` + R=8 SQ8 | Vamana aprox. — grafo menor | O(L·R) ≈ O(512) | < 1 s (mmap) | ~0 — mmap compartilhado | ~92–96% (L=64) |
-| `hnswflat` + M=3 SQ8 (padrão) | HNSW multi-camada aprox.; grafo flat mmap | O(log N) | < 1 s (mmap) | ~143 MB mmap + ~15 MB heap ≈ 158 MB RSS | ~96% (ef=50, refine) |
-| `hnswflat` + M=4 SQ8 | HNSW flat — mais conexões por nó | O(log N) | < 1 s (mmap) | ~166 MB mmap + ~15 MB heap ≈ 181 MB RSS | ~97% (ef=50, refine) |
+| `hnswflat` + M=3 M0=6 SQ8 (padrão) | HNSW multi-camada aprox.; grafo flat mmap | O(log N) | < 1 s (mmap) | ~143 MB mmap + ~15 MB heap ≈ 158 MB RSS | ~96% (ef=50, refine) |
+| `hnswflat` + M=3 M0=8 SQ8 | HNSW flat — mais conexões na layer-0 | O(log N) | < 1 s (mmap) | ~167 MB mmap + ~15 MB heap ≈ 182 MB RSS | ~97.5% (ef=50, refine) |
+| `hnswflat` + M=3 M0=10 SQ8 | HNSW flat — alta acurácia, 1 instância | O(log N) | < 1 s (mmap) | ~191 MB mmap + ~15 MB heap ≈ 206 MB RSS | ~98.5% (ef=50, refine) |
 
 Quando `VECTOR_SEARCHER=hnsw`, o servidor detecta automaticamente se `resources/references.hnsw` existe:
 - **Arquivo presente** (`cmd/preprocess` foi executado com `BUILD_HNSW=true`): usa `hnsw.Load` — carrega o grafo serializado em O(N), sem custo de build. Vetores ficam em heap (~170 MB por instância).
@@ -492,55 +502,83 @@ A tabela cobre as combinações mais relevantes para N = 3.000.000, D = 14, `IVF
 
 #### Ranqueamento de configurações HNSW flat
 
-O HNSW flat visita muito menos vetores que o IVF (acesso logarítmico vs linear), mas cada nó custa mais por acesso aleatório ao mmap (~100 ns de cache miss vs ~2 ns de scan sequencial). A latência é portanto dominada por dois fatores: **`HNSWFLAT_M`** determina a memória e a conectividade do grafo (fixa para todas as queries), e **`HNSWFLAT_EF`** controla o número de nós visitados por query (ajustável em runtime sem rebuild).
+O HNSW flat tem três parâmetros de build que afetam recall de forma independente:
 
-**Memória por instância** depende exclusivamente de M:
+| Parâmetro | Papel | Custo de rebuild? |
+|---|---|---|
+| `HNSWFLAT_EF` | beam search em runtime — mais candidatos por query | ❌ não |
+| `HNSWFLAT_EF_BUILD` + `HNSWFLAT_REFINE` | qualidade das conexões durante a construção | ✓ sim |
+| **`HNSWFLAT_M0`** | **grau da layer-0 — mais conexões = mais caminhos para os vizinhos verdadeiros** | **✓ sim** |
 
-| M | layer-0 adj | Upper CSR | SQ8 vecs | labels+levels | **Total mmap** | **RSS/instância** |
-|---|:---:|:---:|:---:|:---:|:---:|:---:|
-| M=3 | ~72 MB | ~23 MB | ~42 MB | ~6 MB | ~143 MB | **~158 MB** — cabe em 165 MB |
-| M=4 | ~96 MB | ~27 MB | ~42 MB | ~6 MB | ~166 MB⁺ | **~181 MB⁺** — excede 165 MB |
+`HNSWFLAT_M` controla apenas as camadas superiores (navegação); `HNSWFLAT_M0` controla a layer-0, onde o recall de fato acontece. Cada conexão extra em layer-0 custa ~12 MB de mmap (= N × 4 bytes) mas melhora o recall em ~0,5–1 pp.
 
-⁺ M=4 requer 1 instância (memory: "200MB") ou limite Docker superior a 181 MB.
+**Memória por instância** em função de M e M0:
 
-A tabela abaixo assume `HNSWFLAT_SQ8=true`, `HNSWFLAT_REFINE=true` (padrão), N = 3.000.000, D = 14. A **latência estimada** inclui nós visitados × ~0,10 µs (acesso aleatório ao mmap + distância SQ8) + ~300 µs base (HTTP/JSON + overhead de heap e níveis). O refinamento melhora o recall sem alterar a latência de query.
+| `HNSWFLAT_M` (upper) | `HNSWFLAT_M0` (layer-0) | layer-0 adj | Upper CSR | **Total mmap** | **RSS** | Instâncias no budget 350 MB |
+|:---:|:---:|:---:|:---:|:---:|:---:|---|
+| 3 | **6** (padrão 2×M) | ~72 MB | ~23 MB | **~143 MB** | **~158 MB** | **2 instâncias** (165 MB cada) |
+| 3 | 7 | ~84 MB | ~23 MB | ~155 MB | ~170 MB | 1 instância† (≥172 MB) |
+| 3 | 8 | ~96 MB | ~23 MB | ~167 MB | ~182 MB | 1 instância† (≥184 MB) |
+| 3 | 10 | ~120 MB | ~23 MB | ~191 MB | ~206 MB | 1 instância† (≥208 MB) |
+| 4 | **8** (padrão 2×M) | ~96 MB | ~27 MB | **~166 MB** | **~181 MB** | 1 instância† (≥184 MB) |
 
-| # | `HNSWFLAT_M` | `HNSWFLAT_EF` | Nós visitados/query | RSS/instância | Speedup vs brute | Recall k=5 (est.) | Latência est. | Build (`HNSWFLAT_EF_BUILD`, refine) |
-|---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
-| 1 | 3 | 10 | ~90 | ~158 MB | ~44× | ~86% | ~310 µs | ~10 min (100, ✓) |
-| 2 | 3 | 20 | ~180 | ~158 MB | ~22× | ~92% | ~320 µs | ~10 min (100, ✓) |
-| **3 ★** | **3** | **50** | **~450** | **~158 MB** | **~9×** | **~96%** | **~345 µs** | **~10 min (100, ✓)** |
-| 4 | 3 | 100 | ~900 | ~158 MB | ~4× | ~98% | ~390 µs | ~10 min (100, ✓) |
-| 5 | 3 | 200 | ~1800 | ~158 MB | ~2× | ~99% | ~480 µs | ~10 min (100, ✓) |
-| 6 | 3 | 50 | ~450 | ~158 MB | ~9× | ~97% | ~345 µs | ~20 min (200, ✓) |
-| 7 | 3 | 50 | ~450 | ~158 MB | ~9× | ~98% | ~345 µs | ~30 min (300, ✓) |
-| 8 | 3 | 100 | ~900 | ~158 MB | ~4× | ~99% | ~390 µs | ~30 min (300, ✓) |
-| 9 | 4 | 20 | ~240 | ~181 MB⁺ | ~17× | ~93% | ~325 µs | ~16 min (100, ✓) |
-| **10 ★** | **4** | **50** | **~600** | **~181 MB⁺** | **~7×** | **~97%** | **~360 µs** | **~16 min (100, ✓)** |
-| 11 | 4 | 100 | ~1200 | ~181 MB⁺ | ~3× | ~98% | ~420 µs | ~16 min (100, ✓) |
-| 12 | 4 | 50 | ~600 | ~181 MB⁺ | ~7× | ~99% | ~360 µs | ~32 min (200, ✓) |
+† Budget de 350 MB com 1 instância + nginx (30 MB) deixa até ~320 MB por container.
+
+A tabela abaixo assume `HNSWFLAT_SQ8=true`, `HNSWFLAT_REFINE=true` (padrão), N = 3.000.000, D = 14. A **latência estimada** inclui nós visitados × ~0,10 µs + ~300 µs base (HTTP/JSON). Nós visitados ≈ ef × M0 × 1,5. O refinamento melhora o recall sem alterar a latência de query.
+
+| # | M | M0 | `HNSWFLAT_EF` | Nós/query | RSS/instância | Speedup vs brute | Recall k=5 (est.) | Latência est. | Build (ef_build, refine) |
+|---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+| 1 | 3 | 6 | 10 | ~90 | ~158 MB | ~44× | ~86% | ~310 µs | ~10 min (100, ✓) |
+| 2 | 3 | 6 | 20 | ~180 | ~158 MB | ~22× | ~92% | ~320 µs | ~10 min (100, ✓) |
+| **3 ★** | **3** | **6** | **50** | **~450** | **~158 MB** | **~9×** | **~96%** | **~345 µs** | **~10 min (100, ✓)** |
+| 4 | 3 | 6 | 100 | ~900 | ~158 MB | ~4× | ~98% | ~390 µs | ~10 min (100, ✓) |
+| 5 | 3 | 6 | 200 | ~1800 | ~158 MB | ~2× | ~99% | ~480 µs | ~10 min (100, ✓) |
+| 6 | 3 | 6 | 50 | ~450 | ~158 MB | ~9× | ~97% | ~345 µs | ~20 min (200, ✓) |
+| 7 | 3 | 6 | 50 | ~450 | ~158 MB | ~9× | ~98% | ~345 µs | ~30 min (300, ✓) |
+| 8 | 3 | 6 | 100 | ~900 | ~158 MB | ~4× | ~99% | ~390 µs | ~30 min (300, ✓) |
+| 9 | 4 | 8 | 20 | ~240 | ~181 MB† | ~17× | ~93% | ~325 µs | ~16 min (100, ✓) |
+| **10 ★** | **4** | **8** | **50** | **~600** | **~181 MB†** | **~7×** | **~97%** | **~360 µs** | **~16 min (100, ✓)** |
+| 11 | 4 | 8 | 100 | ~1200 | ~181 MB† | ~3× | ~98% | ~420 µs | ~16 min (100, ✓) |
+| 12 | 4 | 8 | 50 | ~600 | ~181 MB† | ~7× | ~99% | ~360 µs | ~32 min (200, ✓) |
+| 13 | 3 | **7** | 50 | ~525 | ~170 MB† | ~8× | ~97% | ~353 µs | ~10 min (100, ✓) |
+| 14 | 3 | **7** | 100 | ~1050 | ~170 MB† | ~4× | ~98.5% | ~405 µs | ~10 min (100, ✓) |
+| 15 | 3 | **8** | 50 | ~600 | ~182 MB† | ~7× | ~97.5% | ~360 µs | ~10 min (100, ✓) |
+| 16 | 3 | **8** | 100 | ~1200 | ~182 MB† | ~3× | ~99% | ~420 µs | ~10 min (100, ✓) |
+| 17 | 3 | **10** | 50 | ~750 | ~206 MB† | ~5× | ~98.5% | ~375 µs | ~10 min (100, ✓) |
+| 18 | 3 | **10** | 100 | ~1500 | ~206 MB† | ~3× | ~99.5% | ~450 µs | ~10 min (100, ✓) |
+
+† Requer 1 instância no budget de 350 MB (M0 > 6 com 2 instâncias excede 165 MB/container).
 
 **Recall:** fração estimada de queries em que o top-5 exato é recuperado. Valores com `HNSWFLAT_REFINE=true` (padrão). Com `HNSWFLAT_REFINE=false`, subtrair ~2–4 pp; o tempo de build cai ~50%.
 
-**Build:** estimativas para 8 CPUs com N=3M. O ✓ indica `HNSWFLAT_REFINE=true`. O tempo inclui: construção inicial O(N × ef_build × 2M) + passagem de refinamento layer-0 O(N × ef_build).
+**Build:** estimativas para 8 CPUs com N=3M. O ✓ indica `HNSWFLAT_REFINE=true`. Linhas #13–#18 usam M0 > 6 via `HNSWFLAT_M0=7/8/10`.
+
+**Impacto de M0 fixando M=3, ef=50, ef_build=100, refine=true:**
+
+| `HNSWFLAT_M0` | Δ mmap vs M0=6 | RSS | Docker mínimo | Recall | Ganho vs M0=6 |
+|:---:|:---:|:---:|:---:|:---:|:---:|
+| 6 (padrão) | — | ~158 MB | 165 MB | ~96% | — |
+| 7 | +12 MB | ~170 MB | 172 MB | ~97% | **+1 pp** |
+| 8 | +24 MB | ~182 MB | 184 MB | ~97.5% | **+1.5 pp** |
+| 10 | +48 MB | ~206 MB | 208 MB | ~98.5% | **+2.5 pp** |
 
 **Análise por critério da competição:**
 
 | Critério | Config | Justificativa |
 |----------|--------|---------------|
-| Menor latência | #1 M=3/ef=10 | ~310 µs; recall ~86% — risco de corte de detecção |
-| Menor latência com recall seguro (≥88%) | #2 M=3/ef=20 | ~320 µs; recall ~92% |
-| **Melhor balanço geral M=3 ★** | **#3 M=3/ef=50 (eb=100, refine)** | **~345 µs; recall ~96%; cabe em 165 MB** |
-| Melhor recall sem rebuild | #4 M=3/ef=100 | ~390 µs; recall ~98%; só `HNSWFLAT_EF` muda |
-| Mesmo tempo, mais recall | #7 M=3/ef=50 (eb=300, refine) | mesma latência que #3; recall ~98% |
-| Recall máximo M=3 dentro de p99 ≤ 1 ms | #8 M=3/ef=100 (eb=300, refine) | ~390 µs; recall ~99% |
-| **Melhor balanço M=4 ★** | **#10 M=4/ef=50 (eb=100, refine)** | **~360 µs; recall ~97%; requer limite > 165 MB** |
+| Menor latência | #1 M=3/M0=6/ef=10 | ~310 µs; recall ~86% — risco de corte de detecção |
+| Menor latência com recall seguro (≥88%) | #2 M=3/M0=6/ef=20 | ~320 µs; recall ~92% |
+| **Melhor balanço 2 instâncias ★** | **#3 M=3/M0=6/ef=50** | **~345 µs; recall ~96%; 2 instâncias em 165 MB** |
+| Melhor recall sem rebuild | #4 M=3/M0=6/ef=100 | ~390 µs; recall ~98%; só `HNSWFLAT_EF` muda |
+| Mais recall sem mudar ef_build | #13 M=3/M0=7/ef=50 | mesmo ef; +1 pp via M0; 1 instância (172 MB) |
+| Alto recall, 1 instância | #18 M=3/M0=10/ef=100 | ~450 µs; recall ~99.5%; 1 instância (208 MB) |
+| **Melhor balanço M=4 ★** | **#10 M=4/M0=8/ef=50** | **~360 µs; recall ~97%; 1 instância (184 MB)** |
 
-> **HNSW flat vs IVF:** a config padrão M=3/ef=50 (latência ~345 µs, recall ~96%) é ~20% mais rápida e ~2 pp mais precisa que a config IVF ★ (nlist=2048/nprobe=64, ~437 µs, ~94% recall), ao custo de build mais longo. O ganho vem da natureza O(log N) do HNSW vs O(nprobe·N/nlist) do IVF.
+> **HNSW flat vs IVF:** a config padrão M=3/M0=6/ef=50 (latência ~345 µs, recall ~96%) é ~20% mais rápida e ~2 pp mais precisa que a config IVF ★ (nlist=2048/nprobe=64, ~437 µs, ~94% recall), ao custo de build mais longo. O ganho vem da natureza O(log N) do HNSW vs O(nprobe·N/nlist) do IVF.
 
-> **p99 ≤ 1 ms:** todas as configurações da tabela operam bem abaixo de 1 ms. Mesmo a #8 (~480 µs) tem folga de ~520 µs — ao contrário do IVF onde configs de alta recall se aproximam do limiar.
+> **p99 ≤ 1 ms:** todas as configurações da tabela operam bem abaixo de 1 ms. Mesmo a #18 (~450 µs) tem folga de ~550 µs — ao contrário do IVF onde configs de alta recall se aproximam do limiar.
 
-> **`HNSWFLAT_EF` vs `HNSWFLAT_EF_BUILD` vs `HNSWFLAT_REFINE`:** `HNSWFLAT_EF` é variável em runtime (sem rebuild). `HNSWFLAT_EF_BUILD` e `HNSWFLAT_REFINE` são fixos por imagem Docker. Para explorar recall/latência sem rebuild, ajuste apenas `HNSWFLAT_EF` no `.env`; para melhorar o teto de recall, aumente `ef_build` ou habilite `refine=true` e rebuilde.
+> **Três levers independentes:** `HNSWFLAT_EF` ajusta recall/latência em runtime sem rebuild. `HNSWFLAT_EF_BUILD` e `HNSWFLAT_REFINE` melhoram a qualidade do grafo (rebuild necessário, sem custo em runtime). `HNSWFLAT_M0` aumenta o número de caminhos na layer-0 (rebuild + mais memória, sem custo em latência proporcional ao ganho de recall).
 
 ### Rodar a aplicação
 
@@ -589,7 +627,8 @@ VECTOR_SEARCHER=vptree ./server
 | `VAMANA_ALPHA` | `1.2` | Build time | Multiplicador RobustPrune; > 1.0 cria arestas de longo alcance (melhor recall) |
 | `VAMANA_SQ8` | `true` | Build time | `true` = uint8 por dim nos vetores (~42 MB); `false` = float32 (~168 MB); gravado no arquivo, lido automaticamente em runtime |
 | `BUILD_HNSWFLAT` | `false` | Build time | Quando `true`, `cmd/preprocess` gera `references.hnswflat`; obrigatório para `VECTOR_SEARCHER=hnswflat` |
-| `HNSWFLAT_M` | `3` | Build time | Grau máximo por nó nas camadas superiores; layer 0 usa 2×M; M=3 → ~143 MB mmap; M=4 → ~166 MB |
+| `HNSWFLAT_M` | `3` | Build time | Grau máximo por nó nas camadas superiores (navegação); não afeta diretamente o recall |
+| `HNSWFLAT_M0` | `0` | Build time | Grau por nó na layer-0 (recall crítico); `0` = 2×M; cada +1 = +12 MB mmap, +0,5–1 pp recall |
 | `HNSWFLAT_EF_BUILD` | `100` | Build time | Tamanho da lista de candidatos durante a construção; maior = melhor grafo, build mais lento |
 | `HNSWFLAT_REFINE` | `true` | Build time | `true` = passagem de refinamento da layer-0 (+50–100% build, +4–8 pp recall); `false` = mais rápido |
 | `HNSWFLAT_SQ8` | `true` | Build time | `true` = uint8 por dim (~42 MB vetores); `false` = float32 (~168 MB, excede o budget de 165 MB) |
@@ -636,7 +675,8 @@ O `docker-compose.yml` lê as variáveis do arquivo `.env` na raiz do projeto. A
 | `VAMANA_ALPHA` | Build arg (`ARG`) | Multiplicador RobustPrune (padrão 1.2) |
 | `VAMANA_SQ8` | Build arg (`ARG`) | `true` (padrão) = vetores uint8 no índice; `false` = float32 |
 | `BUILD_HNSWFLAT` | Build arg (`ARG`) | Quando `true`, `cmd/preprocess` gera `references.hnswflat` durante o `docker build` |
-| `HNSWFLAT_M` | Build arg (`ARG`) | Grau máximo nas camadas superiores (padrão 3); M=3 → ~143 MB mmap (SQ8) |
+| `HNSWFLAT_M` | Build arg (`ARG`) | Grau das camadas superiores (padrão 3); afeta navegação, não recall diretamente |
+| `HNSWFLAT_M0` | Build arg (`ARG`) | Grau da layer-0 (padrão 0 = 2×M); principal lever de recall; +1 = +12 MB mmap, +0,5–1 pp |
 | `HNSWFLAT_EF_BUILD` | Build arg (`ARG`) | Beam width na construção (padrão 100); maior = melhor recall, build mais lento |
 | `HNSWFLAT_REFINE` | Build arg (`ARG`) | `true` (padrão) = refinamento layer-0 após build (+50–100% build, +4–8 pp recall) |
 | `HNSWFLAT_SQ8` | Build arg (`ARG`) | `true` (padrão) = uint8 por dim; `false` = float32 (~168 MB, excede o budget) |
@@ -803,7 +843,7 @@ Os arquivos em `resources/` são carregados na inicialização da aplicação e 
 | `references.bin` | **Gerado por `cmd/preprocess`**. Binário flat SoA com float32 + uint8. Lido via mmap em runtime por todos os modos. |
 | `references.hnsw` | **Gerado por `cmd/preprocess`** quando `BUILD_HNSW=true`. Grafo HNSW serializado. Carregado por `hnsw.Load` quando `VECTOR_SEARCHER=hnsw`; elimina o custo de build no startup. |
 | `references.ivf` | **Gerado por `cmd/preprocess`** quando `BUILD_IVF=true`. Formato flat mmap: `[uint32 nlist][uint32 N][uint8 flags][opt. params SQ8][centroides][sizes][vecFlat8 ou vecFlat32][labelFlat]`. `vecFlat8` e `labelFlat` mapeados zero-copy no server (~43 MB mmap + ~15 MB heap = ~58 MB RSS com SQ8). Obrigatório para `VECTOR_SEARCHER=ivf`. |
-| `references.hnswflat` | **Gerado por `cmd/preprocess`** quando `BUILD_HNSWFLAT=true`. `[32B header][opt. SQ8][N×VectorSize B vecs][N B labels][N B levels][N×2M×4B layer-0 adj][CSR upper]`. Totalmente mmap'd zero-copy no server. ~143 MB para M=3 SQ8, ~166 MB para M=4 SQ8. Obrigatório para `VECTOR_SEARCHER=hnswflat`. |
+| `references.hnswflat` | **Gerado por `cmd/preprocess`** quando `BUILD_HNSWFLAT=true`. `[32B header: magic+N+M+L+entry+upper_n+flags+M0][opt. SQ8][N×VectorSize B vecs][N B labels][N B levels][N×M0×4B layer-0 adj][CSR upper]`. Totalmente mmap'd zero-copy no server. Tamanho: ~143 MB (M=3, M0=6, SQ8); ~167 MB (M0=8); ~191 MB (M0=10). M0=0 em arquivos antigos → backward compat usa 2×M. Obrigatório para `VECTOR_SEARCHER=hnswflat`. |
 | `references.vamana` | **Gerado por `cmd/preprocess`** quando `BUILD_VAMANA=true`. Grafo Vamana: `[uint32 N][uint32 R][uint32 medoid][uint32 flags][opt. SQ8 params][N×R uint32 adj.][vetores uint8 ou float32][labels uint8]`. Mmapeado em runtime — compartilhado entre instâncias. ~237 MB para R=16 SQ8; ~141 MB para R=8 SQ8. Obrigatório para `VECTOR_SEARCHER=vamana`. |
 | `mcc_risk.json` | Mapa de MCC para score de risco (0.0–1.0); MCCs ausentes usam `0.5` como padrão |
 | `normalization.json` | Constantes usadas na normalização dos campos do payload para o vetor |

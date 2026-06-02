@@ -40,13 +40,17 @@ type Reference struct {
 }
 
 // New builds a Searcher entirely in memory from refs. Intended for tests.
-func New(refs []Reference, M, efSearch, efConstruction int, sq8 bool, logger *zap.Logger) *Searcher {
+// M0 is the layer-0 degree; 0 defaults to 2×M (same as DefaultM0).
+func New(refs []Reference, M, M0, efSearch, efConstruction int, sq8 bool, logger *zap.Logger) *Searcher {
 	n := len(refs)
 	if n == 0 {
 		return &Searcher{logger: logger}
 	}
 	if M <= 0 {
 		M = DefaultM
+	}
+	if M0 <= 0 {
+		M0 = 2 * M
 	}
 	if efSearch <= 0 {
 		efSearch = DefaultEfSearch
@@ -66,7 +70,7 @@ func New(refs []Reference, M, efSearch, efConstruction int, sq8 bool, logger *za
 		}
 	}
 
-	g := buildGraph(vecs, rawLabels, n, M, efConstruction, logger)
+	g := buildGraph(vecs, rawLabels, n, M, M0, efConstruction, logger)
 
 	var sq8Min, sq8Scale [domain.VectorSize]float32
 	var vecs8 []uint8
@@ -90,6 +94,7 @@ func New(refs []Reference, M, efSearch, efConstruction int, sq8 bool, logger *za
 		upperAdj: g.upperAdj,
 		n:        n,
 		m:        M,
+		m0:       M0,
 		l:        g.numLayers,
 		entry:    g.entry,
 		efSearch: efSearch,
@@ -103,13 +108,17 @@ func New(refs []Reference, M, efSearch, efConstruction int, sq8 bool, logger *za
 }
 
 // Build constructs a flat HNSW index from the binary reference file at binPath
-// and writes it to outPath. M controls the graph degree; efConstruction controls
-// the candidate-list size during construction (higher → better recall, slower build).
+// and writes it to outPath. M controls the upper-layer degree; M0 controls the
+// layer-0 degree (0 defaults to 2×M). efConstruction controls the candidate-list
+// size during construction (higher → better recall, slower build).
 // refine enables the second-pass layer-0 refinement (see DefaultRefine).
 // sq8 controls SQ8 vector quantization.
-func Build(binPath, outPath string, M, efConstruction int, refine, sq8 bool, logger *zap.Logger) error {
+func Build(binPath, outPath string, M, M0, efConstruction int, refine, sq8 bool, logger *zap.Logger) error {
 	if M <= 0 {
 		M = DefaultM
+	}
+	if M0 <= 0 {
+		M0 = 2 * M
 	}
 	if efConstruction <= 0 {
 		efConstruction = DefaultEfConstruction
@@ -150,7 +159,7 @@ func Build(binPath, outPath string, M, efConstruction int, refine, sq8 bool, log
 		zap.Int("cpus", runtime.NumCPU()),
 	)
 
-	g := buildGraph(vecs, rawLabels, n, M, efConstruction, logger)
+	g := buildGraph(vecs, rawLabels, n, M, M0, efConstruction, logger)
 	logger.Info("hnswflat graph built",
 		zap.Int("layers", g.numLayers),
 		zap.Uint32("entry", g.entry),
@@ -162,7 +171,7 @@ func Build(binPath, outPath string, M, efConstruction int, refine, sq8 bool, log
 			efRef = 50
 		}
 		logger.Info("hnswflat refinement pass starting", zap.Int("ef_refinement", efRef))
-		refineLayer0(g.l0adj, vecs, n, M, efRef, g.entry, logger)
+		refineLayer0(g.l0adj, vecs, n, M, M0, efRef, g.entry, logger)
 		logger.Info("hnswflat refinement pass complete")
 	}
 
@@ -174,7 +183,7 @@ func Build(binPath, outPath string, M, efConstruction int, refine, sq8 bool, log
 		logger.Info("hnswflat SQ8 quantization complete")
 	}
 
-	return writeIndex(outPath, n, M, g, sq8, sq8Min, sq8Scale, vecs8, vecs, rawLabels, logger)
+	return writeIndex(outPath, n, M, M0, g, sq8, sq8Min, sq8Scale, vecs8, vecs, rawLabels, logger)
 }
 
 // ---- Graph construction --------------------------------------------------------
@@ -200,7 +209,7 @@ func (sm *shardedMutex) Unlock(id uint32) { sm[id%numShards].Unlock() }
 
 // buildGraph runs the HNSW construction algorithm over vecs and returns the
 // adjacency structure ready for serialization.
-func buildGraph(vecs []float32, rawLabels []uint8, n, M, efConstruction int, logger *zap.Logger) *graph {
+func buildGraph(vecs []float32, rawLabels []uint8, n, M, M0, efConstruction int, logger *zap.Logger) *graph {
 	// Geometric level distribution: P(level ≥ l) = (1/M)^l, mL = 1/ln(M).
 	mL := 1.0 / math.Log(float64(M))
 
@@ -223,8 +232,8 @@ func buildGraph(vecs []float32, rawLabels []uint8, n, M, efConstruction int, log
 	}
 	numLayers := maxLevel + 1
 
-	// Initialize layer-0 adjacency: N × 2M slots, all emptySlot.
-	l0Size := n * 2 * M
+	// Initialize layer-0 adjacency: N × M0 slots, all emptySlot.
+	l0Size := n * M0
 	l0adj := make([]uint32, l0Size)
 	for i := range l0adj {
 		l0adj[i] = emptySlot
@@ -324,22 +333,16 @@ func buildGraph(vecs []float32, rawLabels []uint8, n, M, efConstruction int, log
 				// Beam search from min(curEPLevel, qLevel) down to 0.
 				for layer := min(curEPLevel, qLevel); layer >= 0; layer-- {
 					// Search this layer with ef=efConstruction.
-					var candidates []hItem
-					if layer == 0 {
-						candidates = searchLayerBuild(qVec, entryNode, efConstruction, layer,
-							l0adj, M, upperBuild, &upperMu, distToVec, vis, n)
-					} else {
-						candidates = searchLayerBuild(qVec, entryNode, efConstruction, layer,
-							l0adj, M, upperBuild, &upperMu, distToVec, vis, n)
-					}
+					candidates := searchLayerBuild(qVec, entryNode, efConstruction, layer,
+						l0adj, M, M0, upperBuild, &upperMu, distToVec, vis, n)
 
 					// Clear visited for reuse.
 					for _, c := range candidates {
 						vis[c.node] = false
 					}
 
-					maxDeg := 2 * M
-					targetM := 2 * M
+					maxDeg := M0
+					targetM := M0
 					if layer > 0 {
 						maxDeg = M
 						targetM = M
@@ -385,13 +388,13 @@ func buildGraph(vecs []float32, rawLabels []uint8, n, M, efConstruction int, log
 						}
 
 						sm.Lock(q)
-						addConn(l0adj, upperBuild, &upperMu, q, nb.node, layer, M)
+						addConn(l0adj, upperBuild, &upperMu, q, nb.node, layer, M, M0)
 						sm.Unlock(q)
 
 						sm.Lock(nb.node)
-						addConn(l0adj, upperBuild, &upperMu, nb.node, q, layer, M)
+						addConn(l0adj, upperBuild, &upperMu, nb.node, q, layer, M, M0)
 						// Prune if over capacity.
-						pruneConn(l0adj, upperBuild, &upperMu, nb.node, layer, maxDeg, vecs, M)
+						pruneConn(l0adj, upperBuild, &upperMu, nb.node, layer, maxDeg, vecs, M, M0)
 						sm.Unlock(nb.node)
 					}
 
@@ -438,7 +441,7 @@ func buildGraph(vecs []float32, rawLabels []uint8, n, M, efConstruction int, log
 // and updates its connections. This corrects the asymmetry between early-
 // inserted nodes (connected using a sparse, incomplete graph) and late-inserted
 // ones, yielding significantly better recall without any change to query latency.
-func refineLayer0(l0adj []uint32, vecs []float32, n, M, efRefinement int, entryPoint uint32, logger *zap.Logger) {
+func refineLayer0(l0adj []uint32, vecs []float32, n, M, M0, efRefinement int, entryPoint uint32, logger *zap.Logger) {
 	var sm shardedMutex
 
 	distToVec := func(query []float32, b uint32) float32 {
@@ -489,7 +492,7 @@ func refineLayer0(l0adj []uint32, vecs []float32, n, M, efRefinement int, entryP
 				// Search layer 0 using the full graph starting from the global entry.
 				// Layer 0 only: upper and upperMu can be nil.
 				candidates := searchLayerBuild(qVec, entryPoint, efRefinement, 0,
-					l0adj, M, nil, nil, distToVec, vis, n)
+					l0adj, M, M0, nil, nil, distToVec, vis, n)
 
 				// Exclude self.
 				filtered := candidates[:0]
@@ -499,16 +502,16 @@ func refineLayer0(l0adj []uint32, vecs []float32, n, M, efRefinement int, entryP
 					}
 				}
 
-				neighbors := selectNeighborsHeuristic(qVec, filtered, 2*M, vecs)
+				neighbors := selectNeighborsHeuristic(qVec, filtered, M0, vecs)
 
 				for _, nb := range neighbors {
 					sm.Lock(q)
-					addConn(l0adj, nil, nil, q, nb.node, 0, M)
+					addConn(l0adj, nil, nil, q, nb.node, 0, M, M0)
 					sm.Unlock(q)
 
 					sm.Lock(nb.node)
-					addConn(l0adj, nil, nil, nb.node, q, 0, M)
-					pruneConn(l0adj, nil, nil, nb.node, 0, 2*M, vecs, M)
+					addConn(l0adj, nil, nil, nb.node, q, 0, M, M0)
+					pruneConn(l0adj, nil, nil, nb.node, 0, M0, vecs, M, M0)
 					sm.Unlock(nb.node)
 				}
 
@@ -560,7 +563,7 @@ func greedyUpperBuild(qVec []float32, entry uint32, layer int, upper map[uint32]
 // searchLayerBuild performs ef-beam search at the given layer in the build graph.
 // vis is reset for each used node before return.
 func searchLayerBuild(qVec []float32, entry uint32, ef, layer int,
-	l0adj []uint32, M int,
+	l0adj []uint32, M, M0 int,
 	upper map[uint32][][]uint32, upperMu *sync.Mutex,
 	distFn func([]float32, uint32) float32,
 	vis []bool, n int) []hItem {
@@ -581,8 +584,8 @@ func searchLayerBuild(qVec []float32, entry uint32, ef, layer int,
 
 		var nbs []uint32
 		if layer == 0 {
-			base := int(c.node) * 2 * M
-			nbs = l0adj[base : base+2*M]
+			base := int(c.node) * M0
+			nbs = l0adj[base : base+M0]
 		} else {
 			upperMu.Lock()
 			nbs = append([]uint32(nil), upperNeighborsBuild(upper, c.node, layer)...)
@@ -673,10 +676,10 @@ func upperNeighborsBuild(upper map[uint32][][]uint32, node uint32, layer int) []
 }
 
 // addConn adds neighbor to node's adjacency at the given layer.
-func addConn(l0adj []uint32, upper map[uint32][][]uint32, mu *sync.Mutex, node, neighbor uint32, layer, M int) {
+func addConn(l0adj []uint32, upper map[uint32][][]uint32, mu *sync.Mutex, node, neighbor uint32, layer, M, M0 int) {
 	if layer == 0 {
-		base := int(node) * 2 * M
-		for j := 0; j < 2*M; j++ {
+		base := int(node) * M0
+		for j := 0; j < M0; j++ {
 			if l0adj[base+j] == emptySlot {
 				l0adj[base+j] = neighbor
 				return
@@ -696,13 +699,13 @@ func addConn(l0adj []uint32, upper map[uint32][][]uint32, mu *sync.Mutex, node, 
 }
 
 // pruneConn trims node's connections at layer to at most maxDeg using the heuristic.
-func pruneConn(l0adj []uint32, upper map[uint32][][]uint32, mu *sync.Mutex, node uint32, layer, maxDeg int, vecs []float32, M int) {
+func pruneConn(l0adj []uint32, upper map[uint32][][]uint32, mu *sync.Mutex, node uint32, layer, maxDeg int, vecs []float32, M, M0 int) {
 	nodeVec := vecs[int(node)*domain.VectorSize : int(node)*domain.VectorSize+domain.VectorSize]
 
 	if layer == 0 {
-		base := int(node) * 2 * M
+		base := int(node) * M0
 		var cands []hItem
-		for j := 0; j < 2*M; j++ {
+		for j := 0; j < M0; j++ {
 			nb := l0adj[base+j]
 			if nb == emptySlot {
 				continue
@@ -716,7 +719,7 @@ func pruneConn(l0adj []uint32, upper map[uint32][][]uint32, mu *sync.Mutex, node
 		sort.Slice(cands, func(i, j int) bool { return cands[i].dist < cands[j].dist })
 		chosen := selectNeighborsHeuristic(nodeVec, cands, maxDeg, vecs)
 		// Reset and write chosen.
-		for j := 0; j < 2*M; j++ {
+		for j := 0; j < M0; j++ {
 			l0adj[base+j] = emptySlot
 		}
 		for j, c := range chosen {
@@ -851,7 +854,7 @@ func quantize(vecs []float32, n int, minV, scale [domain.VectorSize]float32) []u
 
 // ---- Serialization -------------------------------------------------------------
 
-func writeIndex(outPath string, n, M int, g *graph, sq8 bool,
+func writeIndex(outPath string, n, M, M0 int, g *graph, sq8 bool,
 	sq8Min, sq8Scale [domain.VectorSize]float32,
 	vecs8 []uint8, vecsF32 []float32, labels []uint8,
 	logger *zap.Logger) error {
@@ -881,7 +884,7 @@ func writeIndex(outPath string, n, M int, g *graph, sq8 bool,
 	u32(g.entry)
 	u32(upperN)
 	u32(flags)
-	u32(0) // reserved
+	u32(uint32(M0)) // layer-0 degree (was reserved=0 in older files)
 
 	if sq8 {
 		for _, v := range sq8Min {
