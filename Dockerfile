@@ -23,13 +23,21 @@ ARG BUILD_HNSW=false
 ARG BUILD_IVF=false
 ARG IVF_NLIST=1024
 ARG IVF_SQ8=true
+ARG BUILD_VAMANA=false
+ARG VAMANA_R=16
+ARG VAMANA_BUILD_L=0
+ARG VAMANA_ALPHA=1.2
+ARG VAMANA_SQ8=true
 RUN BUILD_HNSW=${BUILD_HNSW} BUILD_IVF=${BUILD_IVF} IVF_NLIST=${IVF_NLIST} IVF_SQ8=${IVF_SQ8} \
+    BUILD_VAMANA=${BUILD_VAMANA} VAMANA_R=${VAMANA_R} VAMANA_BUILD_L=${VAMANA_BUILD_L} \
+    VAMANA_ALPHA=${VAMANA_ALPHA} VAMANA_SQ8=${VAMANA_SQ8} \
     CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
     go run ./cmd/preprocess
 
 # Collect runtime resources into /app/dist/resources/.
 # references.hnsw is included only when BUILD_HNSW=true.
 # references.ivf is included only when BUILD_IVF=true.
+# references.vamana is included only when BUILD_VAMANA=true.
 RUN mkdir -p /app/dist/resources && \
     cp resources/references.bin \
        resources/mcc_risk.json \
@@ -40,6 +48,9 @@ RUN mkdir -p /app/dist/resources && \
     fi && \
     if [ -f resources/references.ivf ]; then \
         cp resources/references.ivf /app/dist/resources/; \
+    fi && \
+    if [ -f resources/references.vamana ]; then \
+        cp resources/references.vamana /app/dist/resources/; \
     fi
 
 # ── Runtime ───────────────────────────────────────────────────────────────────

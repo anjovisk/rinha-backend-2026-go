@@ -25,6 +25,7 @@ import (
 
 	"anjovisk/fraud-detection/internal/adapter/hnsw"
 	"anjovisk/fraud-detection/internal/adapter/ivf"
+	"anjovisk/fraud-detection/internal/adapter/vamana"
 	"anjovisk/fraud-detection/internal/domain"
 )
 
@@ -138,6 +139,12 @@ func main() {
 	} else {
 		log.Printf("skipping IVF-SQ8 index build (BUILD_IVF != true)")
 	}
+
+	if os.Getenv("BUILD_VAMANA") == "true" {
+		buildVamana(outPath)
+	} else {
+		log.Printf("skipping Vamana index build (BUILD_VAMANA != true)")
+	}
 }
 
 // buildHNSW builds an HNSW approximate index from binPath and exports it to
@@ -187,6 +194,54 @@ func buildIVF(binPath string) {
 	}
 
 	log.Printf("done: IVF index → %s", ivfPath)
+}
+
+// buildVamana constructs a Vamana approximate index from binPath and exports it to
+// resources/references.vamana. Parameters are read from environment variables:
+//
+//	VAMANA_R          max degree per node (default 16)
+//	VAMANA_BUILD_L    beam width used during graph construction (default 125);
+//	                  reduce to 64–75 to cut build time ~50% at a small recall cost
+//	VAMANA_ALPHA      RobustPrune multiplier (default 1.2)
+//	VAMANA_SQ8        "false" to disable 8-bit quantization (default true)
+func buildVamana(binPath string) {
+	const vamanaPath = "resources/references.vamana"
+
+	r := vamana.DefaultR
+	if raw := os.Getenv("VAMANA_R"); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil && n > 0 {
+			r = n
+		}
+	}
+
+	// VAMANA_BUILD_L controls the construction beam width (separate from the
+	// query-time VAMANA_L). 0 means use the package default (DefaultBuildL=125).
+	buildL := 0
+	if raw := os.Getenv("VAMANA_BUILD_L"); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil && n > 0 {
+			buildL = n
+		}
+	}
+
+	alpha := vamana.DefaultAlpha
+	if raw := os.Getenv("VAMANA_ALPHA"); raw != "" {
+		if f, err := strconv.ParseFloat(raw, 32); err == nil && f > 0 {
+			alpha = float32(f)
+		}
+	}
+
+	sq8 := vamana.DefaultSQ8
+	if os.Getenv("VAMANA_SQ8") == "false" {
+		sq8 = false
+	}
+
+	log.Printf("building Vamana index (R=%d, build_L=%d, alpha=%.2f, sq8=%v)…", r, buildL, alpha, sq8)
+
+	if err := vamana.Build(binPath, vamanaPath, r, buildL, alpha, sq8, zap.NewNop()); err != nil {
+		log.Fatalf("build Vamana index: %v", err)
+	}
+
+	log.Printf("done: Vamana index → %s", vamanaPath)
 }
 
 // isFiniteF32 reports whether f is neither NaN nor infinite.
