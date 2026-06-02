@@ -19,6 +19,8 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
 # fast startup with VECTOR_SEARCHER=hnsw). Adds several minutes to image build time.
 # When BUILD_IVF=true, also builds references.ivf (IVF-SQ8 index for
 # fast startup with VECTOR_SEARCHER=ivf). IVF_NLIST controls cluster count (default 1024).
+# When BUILD_HNSWFLAT=true, builds references.hnswflat (flat mmap HNSW for
+# VECTOR_SEARCHER=hnswflat). HNSWFLAT_M=3 SQ8 → ~143 MB mmap, ~158 MB RSS.
 ARG BUILD_HNSW=false
 ARG BUILD_IVF=false
 ARG IVF_NLIST=1024
@@ -28,9 +30,15 @@ ARG VAMANA_R=16
 ARG VAMANA_BUILD_L=0
 ARG VAMANA_ALPHA=1.2
 ARG VAMANA_SQ8=true
+ARG BUILD_HNSWFLAT=false
+ARG HNSWFLAT_M=3
+ARG HNSWFLAT_EF_BUILD=100
+ARG HNSWFLAT_SQ8=true
 RUN BUILD_HNSW=${BUILD_HNSW} BUILD_IVF=${BUILD_IVF} IVF_NLIST=${IVF_NLIST} IVF_SQ8=${IVF_SQ8} \
     BUILD_VAMANA=${BUILD_VAMANA} VAMANA_R=${VAMANA_R} VAMANA_BUILD_L=${VAMANA_BUILD_L} \
     VAMANA_ALPHA=${VAMANA_ALPHA} VAMANA_SQ8=${VAMANA_SQ8} \
+    BUILD_HNSWFLAT=${BUILD_HNSWFLAT} HNSWFLAT_M=${HNSWFLAT_M} \
+    HNSWFLAT_EF_BUILD=${HNSWFLAT_EF_BUILD} HNSWFLAT_SQ8=${HNSWFLAT_SQ8} \
     CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
     go run ./cmd/preprocess
 
@@ -51,6 +59,9 @@ RUN mkdir -p /app/dist/resources && \
     fi && \
     if [ -f resources/references.vamana ]; then \
         cp resources/references.vamana /app/dist/resources/; \
+    fi && \
+    if [ -f resources/references.hnswflat ]; then \
+        cp resources/references.hnswflat /app/dist/resources/; \
     fi
 
 # ── Runtime ───────────────────────────────────────────────────────────────────

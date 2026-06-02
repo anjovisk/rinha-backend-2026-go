@@ -51,6 +51,7 @@ import (
 
 	httphandler "anjovisk/fraud-detection/internal/adapter/http"
 	"anjovisk/fraud-detection/internal/adapter/hnsw"
+	"anjovisk/fraud-detection/internal/adapter/hnswflat"
 	"anjovisk/fraud-detection/internal/adapter/ivf"
 	"anjovisk/fraud-detection/internal/adapter/knn"
 	"anjovisk/fraud-detection/internal/adapter/partition"
@@ -172,6 +173,7 @@ func loadNormalization(path string, logger *zap.Logger) normalizationConfig {
 func buildNeighborFinder(kind string, logger *zap.Logger) port.NeighborFinder {
 	const refsPath = "resources/references.bin"
 	const hnswPath = "resources/references.hnsw"
+	const hnswflatPath = "resources/references.hnswflat"
 	const ivfPath = "resources/references.ivf"
 	const vamanaPath = "resources/references.vamana"
 	switch kind {
@@ -226,6 +228,24 @@ func buildNeighborFinder(kind string, logger *zap.Logger) port.NeighborFinder {
 		s, err := vamana.Open(vamanaPath, l, logger)
 		if err != nil {
 			logger.Fatal("failed to load Vamana index — run preprocess with BUILD_VAMANA=true",
+				zap.Error(err),
+			)
+		}
+		return s
+	case "hnswflat":
+		efSearch := hnswflat.DefaultEfSearch
+		if raw := os.Getenv("HNSWFLAT_EF"); raw != "" {
+			if n, err := strconv.Atoi(raw); err == nil && n > 0 {
+				efSearch = n
+			}
+		}
+		logger.Info("neighbor finder: HNSW-flat mmap",
+			zap.String("index_path", hnswflatPath),
+			zap.Int("ef_search", efSearch),
+		)
+		s, err := hnswflat.Open(hnswflatPath, efSearch, logger)
+		if err != nil {
+			logger.Fatal("failed to load HNSW-flat index — run preprocess with BUILD_HNSWFLAT=true",
 				zap.Error(err),
 			)
 		}

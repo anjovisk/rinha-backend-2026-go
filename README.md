@@ -64,6 +64,7 @@ As dependências fluem sempre para dentro: adapters conhecem ports, ports conhec
 | `internal/adapter/vamana` | Adapter secundário | Busca aproximada Vamana/DiskANN O(L·R); grafo flat com RobustPrune; mmap compartilhado; selecionado por `VECTOR_SEARCHER=vamana` |
 | `internal/adapter/partition` | Adapter secundário | Busca exata particionada; roteia cada query para um dos 6 sub-índices por `(last_tx_null × is_online × card_present)`; ~3,2× mais rápido que brute sem arquivo de índice extra; selecionado por `VECTOR_SEARCHER=partition` |
 | `internal/adapter/vptree` | Adapter secundário | VP-Tree exato por bin; mesma partição do `partition` + poda pela desigualdade triangular; construído no startup em O(N log N); selecionado por `VECTOR_SEARCHER=vptree` |
+| `internal/adapter/hnswflat` | Adapter secundário | HNSW multi-camada aproximado O(log N) com grafo flat mmap; SQ8 + adjacência zero-copy; construção paralela com `selectNeighborsHeuristic`; selecionado por `VECTOR_SEARCHER=hnswflat` |
 
 ## Stack
 
@@ -78,7 +79,7 @@ As dependências fluem sempre para dentro: adapters conhecem ports, ports conhec
 .
 ├── cmd/
 │   ├── preprocess/
-│   │   └── main.go                    # converte references.json.gz → .bin + .hnsw + .ivf + .vamana
+│   │   └── main.go                    # converte references.json.gz → .bin + .hnsw + .ivf + .vamana + .hnswflat
 │   └── server/
 │       └── main.go                    # bootstrap: carrega recursos, conecta adapters → usecase → HTTP
 ├── internal/
@@ -115,15 +116,20 @@ As dependências fluem sempre para dentro: adapters conhecem ports, ports conhec
 │       ├── partition/
 │       │   ├── partition.go           # implementa NeighborFinder (brute-force particionado); Open, New, FindNearest
 │       │   └── partition_test.go
-│       └── vptree/
-│           ├── vptree.go              # implementa NeighborFinder (VP-Tree exato por bin); Open, New, FindNearest
-│           └── vptree_test.go
+│       ├── vptree/
+│       │   ├── vptree.go              # implementa NeighborFinder (VP-Tree exato por bin); Open, New, FindNearest
+│       │   └── vptree_test.go
+│       └── hnswflat/
+│           ├── hnswflat.go            # implementa NeighborFinder (HNSW flat mmap); Open, Close, FindNearest
+│           ├── build.go               # construção HNSW (paralelo, heuristic pruning), Build, New, SQ8
+│           └── hnswflat_test.go
 ├── resources/
 │   ├── references.json.gz             # fonte original: 3M vetores rotulados (não lida em runtime)
 │   ├── references.bin                 # gerado por cmd/preprocess; lido via mmap em runtime
 │   ├── references.hnsw                # gerado quando BUILD_HNSW=true; grafo HNSW serializado
-│   ├── references.ivf                 # gerado quando BUILD_IVF=true; índice IVF-SQ8 (~45 MB)
+│   ├── references.ivf                 # gerado quando BUILD_IVF=true; índice IVF flat mmap (~58 MB RSS SQ8)
 │   ├── references.vamana              # gerado quando BUILD_VAMANA=true; grafo Vamana (~237 MB R=16 SQ8)
+│   ├── references.hnswflat            # gerado quando BUILD_HNSWFLAT=true; HNSW flat mmap (~143 MB M=3 SQ8)
 │   ├── mcc_risk.json                  # risco por categoria de merchant (MCC)
 │   └── normalization.json             # constantes de normalização
 ├── docs/                              # documentação em português
@@ -217,6 +223,15 @@ BUILD_VAMANA=true VAMANA_R=8 go run ./cmd/preprocess
 
 # Vamana com alpha maior (mais arestas de longo alcance, melhor recall em datasets irregulares)
 BUILD_VAMANA=true VAMANA_ALPHA=1.4 go run ./cmd/preprocess
+
+# HNSW flat M=3 SQ8 (~143 MB mmap, ~158 MB RSS) — necessário para VECTOR_SEARCHER=hnswflat
+BUILD_HNSWFLAT=true go run ./cmd/preprocess
+
+# HNSW flat M=4 SQ8 (~166 MB mmap) — melhor recall, excede o limite de 165 MB/instância
+BUILD_HNSWFLAT=true HNSWFLAT_M=4 go run ./cmd/preprocess
+
+# HNSW flat com ef_build maior (melhor qualidade do grafo, build mais lento)
+BUILD_HNSWFLAT=true HNSWFLAT_EF_BUILD=200 go run ./cmd/preprocess
 ```
 
 O preprocess produz até quatro arquivos:
@@ -250,10 +265,12 @@ O algoritmo usado para encontrar os 5 vizinhos mais próximos é controlado pela
 | `vptree` | VP-Tree exato por bin (poda triangular) | O(N^α) α<1 c/ poda efetiva; O(N/bins) pior caso | alguns segundos (build O(N log N)) | ~16–20 MB heap (6 árvores) | ~100% dentro do bin |
 | `hnsw` + `references.hnsw` presente | HNSW aprox. (`coder/hnsw`, M=4, EfSearch=50) — **Load** | O(log N) | < 1 s (import) | ~170 MB heap (vetores alocados pelo Import) | ~93–97% |
 | `hnsw` + `references.hnsw` ausente | HNSW aprox. — **Open** (build from scratch) | O(log N) | dezenas de segundos (O(N log N)) | ~50–100 MB heap (conexões apenas; vetores no mmap) | ~93–97% |
-| `ivf` + `IVF_SQ8=true` (padrão) | IVF aprox. com SQ8 (K-means + uint8) | O(nprobe·N/nlist) | < 1 s (leitura heap) | ~45 MB heap por instância | ~95–99% (nprobe=32) |
-| `ivf` + `IVF_SQ8=false` | IVF aprox. sem SQ8 (K-means + float32) | O(nprobe·N/nlist) | < 1 s (leitura heap) | ~168 MB heap por instância | ~96–99% (nprobe=32) |
+| `ivf` + `IVF_SQ8=true` (padrão) | IVF aprox. com SQ8 (K-means + uint8) | O(nprobe·N/nlist) | < 1 s (mmap) | ~43 MB mmap + ~15 MB heap ≈ 58 MB RSS | ~95–99% (nprobe=32) |
+| `ivf` + `IVF_SQ8=false` | IVF aprox. sem SQ8 (K-means + float32) | O(nprobe·N/nlist) | < 1 s (heap) | ~168 MB heap por instância | ~96–99% (nprobe=32) |
 | `vamana` + R=16 SQ8 (padrão) | Vamana/DiskANN aprox. (grafo flat + RobustPrune) | O(L·R) ≈ O(1024) | < 1 s (mmap) | ~0 — grafo+vetores compartilhados via mmap/page cache | ~95–98% (L=64) |
 | `vamana` + R=8 SQ8 | Vamana aprox. — grafo menor | O(L·R) ≈ O(512) | < 1 s (mmap) | ~0 — mmap compartilhado | ~92–96% (L=64) |
+| `hnswflat` + M=3 SQ8 (padrão) | HNSW multi-camada aprox.; grafo flat mmap | O(log N) | < 1 s (mmap) | ~143 MB mmap + ~15 MB heap ≈ 158 MB RSS | ~91–95% (ef=50) |
+| `hnswflat` + M=4 SQ8 | HNSW flat — mais conexões por nó | O(log N) | < 1 s (mmap) | ~166 MB mmap + ~15 MB heap ≈ 181 MB RSS | ~93–97% (ef=50) |
 
 Quando `VECTOR_SEARCHER=hnsw`, o servidor detecta automaticamente se `resources/references.hnsw` existe:
 - **Arquivo presente** (`cmd/preprocess` foi executado com `BUILD_HNSW=true`): usa `hnsw.Load` — carrega o grafo serializado em O(N), sem custo de build. Vetores ficam em heap (~170 MB por instância).
@@ -470,6 +487,58 @@ A tabela cobre as combinações mais relevantes para N = 3.000.000, D = 14, `IVF
 
 > **Impacto do nlist no recall a % fixo:** para 3,13% do dataset escaneado, o recall varia de ~80% (nlist=512) a ~94% (nlist=2048) a ~91% (nlist=4096). O ponto ótimo é nlist=2048 — clusters mais coesos que nlist=512/1024, sem o custo de build de nlist=4096.
 
+#### Ranqueamento de configurações HNSW flat
+
+O HNSW flat visita muito menos vetores que o IVF (acesso logarítmico vs linear), mas cada nó custa mais por acesso aleatório ao mmap (~100 ns de cache miss vs ~2 ns de scan sequencial). A latência é portanto dominada por dois fatores: **`HNSWFLAT_M`** determina a memória e a conectividade do grafo (fixa para todas as queries), e **`HNSWFLAT_EF`** controla o número de nós visitados por query (ajustável em runtime sem rebuild).
+
+**Memória por instância** depende exclusivamente de M:
+
+| M | layer-0 adj | Upper CSR | SQ8 vecs | labels+levels | **Total mmap** | **RSS/instância** |
+|---|:---:|:---:|:---:|:---:|:---:|:---:|
+| M=3 | ~72 MB | ~23 MB | ~42 MB | ~6 MB | ~143 MB | **~158 MB** — cabe em 165 MB |
+| M=4 | ~96 MB | ~27 MB | ~42 MB | ~6 MB | ~166 MB⁺ | **~181 MB⁺** — excede 165 MB |
+
+⁺ M=4 requer 1 instância (memory: "200MB") ou limite Docker superior a 181 MB.
+
+A tabela abaixo assume `HNSWFLAT_SQ8=true`, N = 3.000.000, D = 14. A **latência estimada** inclui nós visitados × ~0,10 µs (acesso aleatório ao mmap + distância SQ8) + ~300 µs base (HTTP/JSON + overhead de heap e níveis).
+
+| # | `HNSWFLAT_M` | `HNSWFLAT_EF` | Nós visitados/query | RSS/instância | Speedup vs brute | Recall k=5 (est.) | Latência est. | Build (`HNSWFLAT_EF_BUILD`) |
+|---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+| 1 | 3 | 10 | ~90 | ~158 MB | ~44× | ~82% | ~310 µs | ~5 min (100) |
+| 2 | 3 | 20 | ~180 | ~158 MB | ~22× | ~88% | ~320 µs | ~5 min (100) |
+| **3 ★** | **3** | **50** | **~450** | **~158 MB** | **~9×** | **~93%** | **~345 µs** | **~5 min (100)** |
+| 4 | 3 | 100 | ~900 | ~158 MB | ~4× | ~96% | ~390 µs | ~5 min (100) |
+| 5 | 3 | 200 | ~1800 | ~158 MB | ~2× | ~98% | ~480 µs | ~5 min (100) |
+| 6 | 3 | 50 | ~450 | ~158 MB | ~9× | ~95% | ~345 µs | ~10 min (200) |
+| 7 | 3 | 50 | ~450 | ~158 MB | ~9× | ~96% | ~345 µs | ~15 min (300) |
+| 8 | 3 | 100 | ~900 | ~158 MB | ~4× | ~98% | ~390 µs | ~15 min (300) |
+| 9 | 4 | 20 | ~240 | ~181 MB⁺ | ~17× | ~91% | ~325 µs | ~8 min (100) |
+| **10 ★** | **4** | **50** | **~600** | **~181 MB⁺** | **~7×** | **~95%** | **~360 µs** | **~8 min (100)** |
+| 11 | 4 | 100 | ~1200 | ~181 MB⁺ | ~3× | ~97% | ~420 µs | ~8 min (100) |
+| 12 | 4 | 50 | ~600 | ~181 MB⁺ | ~7× | ~97% | ~360 µs | ~16 min (200) |
+
+**Recall:** fração estimada de queries em que o top-5 exato é recuperado. Com D=14 (baixa dimensionalidade), o HNSW atinge bons recalls com ef moderado; valores dependem do dataset — valide com benchmark local. `HNSWFLAT_EF` é configurável em runtime sem rebuild; `HNSWFLAT_EF_BUILD` afeta apenas a qualidade do grafo (maior = grafo melhor = mesmo ef_search com mais recall).
+
+**Build:** estimativas para 8 CPUs com N=3M. O build é paralelo mas dominado por acessos aleatórios ao mmap de referências (~100 ns/acesso). M maior e ef_build maior aumentam o tempo proporcionalmente.
+
+**Análise por critério da competição:**
+
+| Critério | Config | Justificativa |
+|----------|--------|---------------|
+| Menor latência | #1 M=3/ef=10 | ~310 µs; recall ~82% — risco de corte de detecção |
+| Menor latência com recall seguro (≥88%) | #2 M=3/ef=20 | ~320 µs; recall ~88% |
+| **Melhor balanço geral M=3 ★** | **#3 M=3/ef=50 (ef_build=100)** | **~345 µs; recall ~93%; cabe em 165 MB** |
+| Melhor recall sem rebuild | #4 M=3/ef=100 | ~390 µs; recall ~96%; só HNSWFLAT_EF muda |
+| Mesmo tempo, mais recall | #7 M=3/ef=50 (ef_build=300) | mesma latência que #3, recall ~96% com build mais longo |
+| Alto recall (≥98%) dentro de p99 ≤ 1 ms | #8 M=3/ef=100 (ef_build=300) | ~390 µs; recall ~98% |
+| **Melhor balanço M=4 ★** | **#10 M=4/ef=50 (ef_build=100)** | **~360 µs; recall ~95%; requer limite > 165 MB** |
+
+> **HNSW flat vs IVF:** a config padrão M=3/ef=50 (latência ~345 µs, recall ~93%) é ~20% mais rápida que a config IVF ★ (nlist=2048/nprobe=64, ~437 µs, ~94% recall), ao custo de build mais longo. O ganho vem da natureza O(log N) do HNSW vs O(nprobe·N/nlist) do IVF.
+
+> **p99 ≤ 1 ms:** todas as configurações da tabela operam bem abaixo de 1 ms. Mesmo a #8 (~480 µs) tem folga de ~520 µs — ao contrário do IVF onde configs de alta recall se aproximam do limiar.
+
+> **`HNSWFLAT_EF` vs `HNSWFLAT_EF_BUILD`:** ef_build é fixo por imagem Docker; ef_search é variável em runtime. Para explorar o espaço recall/latência sem rebuild, use configs #1–#5 e ajuste apenas `HNSWFLAT_EF` no `.env`.
+
 ### Rodar a aplicação
 
 ```bash
@@ -503,9 +572,10 @@ VECTOR_SEARCHER=vptree ./server
 |----------|--------|--------|-----------|
 | `PORT` | `8080` | Runtime | Porta de escuta da instância |
 | `LOG_LEVEL` | `info` | Runtime | Nível mínimo de log (`debug`, `info`, `warn`, `error`) |
-| `VECTOR_SEARCHER` | `brute` | Runtime | Backend de busca vetorial (`brute`, `partition`, `vptree`, `hnsw`, `ivf` ou `vamana`) |
+| `VECTOR_SEARCHER` | `brute` | Runtime | Backend de busca vetorial (`brute`, `partition`, `vptree`, `hnsw`, `ivf`, `vamana` ou `hnswflat`) |
 | `IVF_NPROBE` | `32` | Runtime | Clusters pesquisados por query com `VECTOR_SEARCHER=ivf`; maior = mais recall e mais lento |
 | `VAMANA_L` | `64` | Runtime | Beam width na busca com `VECTOR_SEARCHER=vamana`; maior = mais recall e mais lento |
+| `HNSWFLAT_EF` | `50` | Runtime | Beam width na busca com `VECTOR_SEARCHER=hnswflat`; maior = mais recall e mais lento |
 | `BUILD_HNSW` | `false` | Build time | Quando `true`, `cmd/preprocess` gera `references.hnsw`; passado como `ARG` ao Dockerfile |
 | `BUILD_IVF` | `false` | Build time | Quando `true`, `cmd/preprocess` gera `references.ivf`; passado como `ARG` ao Dockerfile |
 | `IVF_NLIST` | `1024` | Build time | Número de clusters K-means para o índice IVF; passado como `ARG` ao Dockerfile |
@@ -515,6 +585,10 @@ VECTOR_SEARCHER=vptree ./server
 | `VAMANA_BUILD_L` | `125` | Build time | Beam width durante a construção do grafo; `0` usa o padrão (125); reduza para 64–75 para cortar o tempo de build ~50% com pequena perda de recall |
 | `VAMANA_ALPHA` | `1.2` | Build time | Multiplicador RobustPrune; > 1.0 cria arestas de longo alcance (melhor recall) |
 | `VAMANA_SQ8` | `true` | Build time | `true` = uint8 por dim nos vetores (~42 MB); `false` = float32 (~168 MB); gravado no arquivo, lido automaticamente em runtime |
+| `BUILD_HNSWFLAT` | `false` | Build time | Quando `true`, `cmd/preprocess` gera `references.hnswflat`; obrigatório para `VECTOR_SEARCHER=hnswflat` |
+| `HNSWFLAT_M` | `3` | Build time | Grau máximo por nó nas camadas superiores; layer 0 usa 2×M; M=3 → ~143 MB mmap; M=4 → ~166 MB |
+| `HNSWFLAT_EF_BUILD` | `100` | Build time | Tamanho da lista de candidatos durante a construção; maior = melhor grafo, build mais lento |
+| `HNSWFLAT_SQ8` | `true` | Build time | `true` = uint8 por dim (~42 MB vetores); `false` = float32 (~168 MB, excede o budget de 165 MB) |
 
 ### Logs
 
@@ -545,18 +619,22 @@ O `docker-compose.yml` lê as variáveis do arquivo `.env` na raiz do projeto. A
 
 | Variável | Tipo | Descrição |
 |----------|------|-----------|
-| `VECTOR_SEARCHER` | Runtime env | Backend de busca (`brute`, `partition`, `vptree`, `hnsw`, `ivf` ou `vamana`); injetado em cada instância de API |
+| `VECTOR_SEARCHER` | Runtime env | Backend de busca (`brute`, `partition`, `vptree`, `hnsw`, `ivf`, `vamana` ou `hnswflat`); injetado em cada instância de API |
 | `IVF_NPROBE` | Runtime env | Clusters pesquisados por query com `ivf` (padrão 32); injetado em cada instância |
 | `VAMANA_L` | Runtime env | Beam width na busca com `vamana` (padrão 64); injetado em cada instância |
 | `BUILD_HNSW` | Build arg (`ARG`) | Quando `true`, `cmd/preprocess` gera `references.hnsw` durante o `docker build` |
 | `BUILD_IVF` | Build arg (`ARG`) | Quando `true`, `cmd/preprocess` gera `references.ivf` durante o `docker build` |
 | `IVF_NLIST` | Build arg (`ARG`) | Clusters K-means para o índice IVF (padrão 1024) |
-| `IVF_SQ8` | Build arg (`ARG`) | `true` (padrão) = SQ8 ativo (~45 MB heap/instância); `false` = float32 (~168 MB) |
+| `IVF_SQ8` | Build arg (`ARG`) | `true` (padrão) = SQ8 ativo (~43 MB mmap + ~15 MB heap); `false` = float32 (~168 MB heap) |
 | `BUILD_VAMANA` | Build arg (`ARG`) | Quando `true`, `cmd/preprocess` gera `references.vamana` durante o `docker build` |
 | `VAMANA_R` | Build arg (`ARG`) | Grau máximo do grafo Vamana (padrão 16); R=8 reduz o arquivo para ~141 MB (SQ8) e acelera o build |
 | `VAMANA_BUILD_L` | Build arg (`ARG`) | Beam width na construção (padrão 125); `64` reduz build ~50% com pequena perda de recall |
 | `VAMANA_ALPHA` | Build arg (`ARG`) | Multiplicador RobustPrune (padrão 1.2) |
 | `VAMANA_SQ8` | Build arg (`ARG`) | `true` (padrão) = vetores uint8 no índice; `false` = float32 |
+| `BUILD_HNSWFLAT` | Build arg (`ARG`) | Quando `true`, `cmd/preprocess` gera `references.hnswflat` durante o `docker build` |
+| `HNSWFLAT_M` | Build arg (`ARG`) | Grau máximo nas camadas superiores (padrão 3); M=3 → ~143 MB mmap (SQ8) |
+| `HNSWFLAT_EF_BUILD` | Build arg (`ARG`) | Beam width na construção (padrão 100); maior = melhor recall, build mais lento |
+| `HNSWFLAT_SQ8` | Build arg (`ARG`) | `true` (padrão) = uint8 por dim; `false` = float32 (~168 MB, excede o budget) |
 
 Para trocar o backend ou habilitar o pré-build, edite o `.env`:
 
@@ -636,6 +714,12 @@ BUILD_VAMANA=true VECTOR_SEARCHER=vamana VAMANA_L=128 docker compose up --build
 # Partition-brute: exato por bin, sem arquivo de índice extra
 VECTOR_SEARCHER=partition docker compose up --build
 
+# HNSW flat M=3 SQ8 (~143 MB mmap, ~158 MB RSS — cabe em 165 MB por instância)
+BUILD_HNSWFLAT=true VECTOR_SEARCHER=hnswflat docker compose up --build
+
+# HNSW flat com ef_search maior em runtime (melhor recall, sem rebuild)
+BUILD_HNSWFLAT=true VECTOR_SEARCHER=hnswflat HNSWFLAT_EF=100 docker compose up --build
+
 # A API fica disponível em http://localhost:9999 (via nginx)
 # Acesso direto às instâncias: http://localhost:8080 e http://localhost:8081
 ```
@@ -713,7 +797,8 @@ Os arquivos em `resources/` são carregados na inicialização da aplicação e 
 | `references.json.gz` | Fonte original: 3 milhões de transações rotuladas (`fraud`/`legit`), comprimida em gzip. Não é lida em runtime. |
 | `references.bin` | **Gerado por `cmd/preprocess`**. Binário flat SoA com float32 + uint8. Lido via mmap em runtime por todos os modos. |
 | `references.hnsw` | **Gerado por `cmd/preprocess`** quando `BUILD_HNSW=true`. Grafo HNSW serializado. Carregado por `hnsw.Load` quando `VECTOR_SEARCHER=hnsw`; elimina o custo de build no startup. |
-| `references.ivf` | **Gerado por `cmd/preprocess`** quando `BUILD_IVF=true`. Índice IVF: `[uint32 nlist][uint8 flags][opt. params SQ8][centroides][por cluster: size + vetores + labels]`. ~45 MB com `IVF_SQ8=true`, ~168 MB com `IVF_SQ8=false`. Obrigatório para `VECTOR_SEARCHER=ivf`. |
+| `references.ivf` | **Gerado por `cmd/preprocess`** quando `BUILD_IVF=true`. Formato flat mmap: `[uint32 nlist][uint32 N][uint8 flags][opt. params SQ8][centroides][sizes][vecFlat8 ou vecFlat32][labelFlat]`. `vecFlat8` e `labelFlat` mapeados zero-copy no server (~43 MB mmap + ~15 MB heap = ~58 MB RSS com SQ8). Obrigatório para `VECTOR_SEARCHER=ivf`. |
+| `references.hnswflat` | **Gerado por `cmd/preprocess`** quando `BUILD_HNSWFLAT=true`. `[32B header][opt. SQ8][N×VectorSize B vecs][N B labels][N B levels][N×2M×4B layer-0 adj][CSR upper]`. Totalmente mmap'd zero-copy no server. ~143 MB para M=3 SQ8, ~166 MB para M=4 SQ8. Obrigatório para `VECTOR_SEARCHER=hnswflat`. |
 | `references.vamana` | **Gerado por `cmd/preprocess`** quando `BUILD_VAMANA=true`. Grafo Vamana: `[uint32 N][uint32 R][uint32 medoid][uint32 flags][opt. SQ8 params][N×R uint32 adj.][vetores uint8 ou float32][labels uint8]`. Mmapeado em runtime — compartilhado entre instâncias. ~237 MB para R=16 SQ8; ~141 MB para R=8 SQ8. Obrigatório para `VECTOR_SEARCHER=vamana`. |
 | `mcc_risk.json` | Mapa de MCC para score de risco (0.0–1.0); MCCs ausentes usam `0.5` como padrão |
 | `normalization.json` | Constantes usadas na normalização dos campos do payload para o vetor |
@@ -725,7 +810,7 @@ Exemplos de payloads e vetores de referência para testes locais estão em `reso
 O processo de avaliação de cada transação segue três etapas:
 
 1. **Vectorização** — os campos do payload são normalizados em um vetor de 14 dimensões (valores entre `0.0` e `1.0`, exceto `minutes_since_last_tx` e `km_from_last_tx` que recebem `-1` quando `last_transaction` é `null`).
-2. **Busca KNN** — os 5 vetores mais próximos são buscados na base de referência usando distância euclidiana. O backend é selecionado via `VECTOR_SEARCHER`: `brute` (exato, O(N), padrão), `partition` (exato por bin, O(N/bins), ~3,2× mais rápido que brute), `vptree` (VP-Tree exato por bin com poda triangular, sub-linear quando a dimensionalidade intrínseca permite), `hnsw` (aproximado, O(log N)), `ivf` (aproximado IVF-SQ8, O(nprobe·N/nlist)) ou `vamana` (aproximado Vamana/DiskANN, O(L·R)).
+2. **Busca KNN** — os 5 vetores mais próximos são buscados na base de referência usando distância euclidiana. O backend é selecionado via `VECTOR_SEARCHER`: `brute` (exato, O(N), padrão), `partition` (exato por bin, O(N/bins), ~3,2× mais rápido que brute), `vptree` (VP-Tree exato por bin com poda triangular, sub-linear quando a dimensionalidade intrínseca permite), `hnsw` (aproximado, O(log N)), `ivf` (aproximado IVF-SQ8, O(nprobe·N/nlist)), `vamana` (aproximado Vamana/DiskANN, O(L·R)) ou `hnswflat` (HNSW multi-camada com grafo flat mmap, O(log N)).
 3. **Decisão** — `fraud_score = fraudes_entre_os_5 / 5`; `approved = fraud_score < 0.6`.
 
 A especificação completa das 14 dimensões e das fórmulas de normalização está em [`docs/REGRAS_DE_DETECCAO.md`](./docs/REGRAS_DE_DETECCAO.md).
