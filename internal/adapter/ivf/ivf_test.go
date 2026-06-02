@@ -1,6 +1,10 @@
 package ivf_test
 
 import (
+	"bytes"
+	"encoding/binary"
+	"math"
+	"os"
 	"testing"
 
 	"go.uber.org/zap"
@@ -108,6 +112,58 @@ func TestIVF_KGreaterThanDataset(t *testing.T) {
 
 		if len(labels) != 2 {
 			t.Errorf("k > dataset size: expected 2 labels, got %d", len(labels))
+		}
+	})
+}
+
+// writeBin writes a minimal references.bin to path with the given entries.
+// Format: [uint32 N][N×VectorSize×float32 vecs][N×uint8 labels].
+func writeBin(t *testing.T, path string, vecs []domain.Vector, labels []uint8) {
+	t.Helper()
+	n := len(vecs)
+	var buf bytes.Buffer
+	b4 := make([]byte, 4)
+	binary.LittleEndian.PutUint32(b4, uint32(n))
+	buf.Write(b4)
+	for _, v := range vecs {
+		for _, dim := range v {
+			binary.LittleEndian.PutUint32(b4, math.Float32bits(float32(dim)))
+			buf.Write(b4)
+		}
+	}
+	buf.Write(labels)
+	if err := os.WriteFile(path, buf.Bytes(), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestIVF_BuildOpenRoundtrip verifies that Build writes the flat format and Open reads it back
+// correctly via mmap, returning results consistent with the in-memory New constructor.
+func TestIVF_BuildOpenRoundtrip(t *testing.T) {
+	forBothModes(t, func(t *testing.T, sq8 bool) {
+		dir := t.TempDir()
+		binFile := dir + "/refs.bin"
+		ivfFile := dir + "/refs.ivf"
+
+		vecs := []domain.Vector{zeroVec, oneVec, nearZeroVec}
+		labels := []uint8{0, 1, 0} // legit, fraud, legit
+
+		writeBin(t, binFile, vecs, labels)
+
+		if err := ivf.Build(binFile, ivfFile, 1, sq8, zap.NewNop()); err != nil {
+			t.Fatalf("Build: %v", err)
+		}
+
+		s, err := ivf.Open(ivfFile, 1, zap.NewNop())
+		if err != nil {
+			t.Fatalf("Open: %v", err)
+		}
+		defer s.Close()
+
+		// nearZeroVec is closest to zeroVec (legit), not oneVec (fraud).
+		got := s.FindNearest(nearZeroVec, 1)
+		if len(got) != 1 || got[0] != "legit" {
+			t.Errorf("expected [legit], got %v", got)
 		}
 	})
 }

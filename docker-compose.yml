@@ -9,6 +9,12 @@ services:
     depends_on:
       - api-1
       - api-2
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9999/ready"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
     networks:
       - api-network
     restart: unless-stopped
@@ -38,10 +44,12 @@ services:
       - api-network
     restart: unless-stopped
     environment:
-      - LOG_LEVEL=error
+      - LOG_LEVEL=${LOG_LEVEL:-error}
       - VECTOR_SEARCHER=${VECTOR_SEARCHER:-brute}
       - IVF_NPROBE=${IVF_NPROBE:-32}
       - VAMANA_L=${VAMANA_L:-64}
+      - GOMEMLIMIT=140MiB
+      - GOMAXPROCS=1
     deploy:
       resources:
         limits:
@@ -68,10 +76,12 @@ services:
       - api-network
     restart: unless-stopped
     environment:
-      - LOG_LEVEL=error
+      - LOG_LEVEL=${LOG_LEVEL:-error}
       - VECTOR_SEARCHER=${VECTOR_SEARCHER:-brute}
       - IVF_NPROBE=${IVF_NPROBE:-32}
       - VAMANA_L=${VAMANA_L:-64}
+      - GOMEMLIMIT=140MiB
+      - GOMAXPROCS=1
     deploy:
       resources:
         limits:

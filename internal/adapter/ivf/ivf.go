@@ -21,6 +21,7 @@ import (
 	"math"
 	"os"
 	"sync"
+	"syscall"
 
 	"go.uber.org/zap"
 
@@ -44,6 +45,11 @@ const DefaultNprobe = 32
 
 // flagSQ8 is the bitmask in the flags byte that signals SQ8 quantization is active.
 const flagSQ8 = uint8(1 << 0)
+
+// flagFlat is the bitmask in the flags byte that signals the flat-layout file format.
+// Files produced by Build always set this bit. Open rejects files without it so that
+// stale per-cluster-layout indexes are detected immediately with a clear error message.
+const flagFlat = uint8(1 << 1)
 
 // Searcher holds an IVF index and implements port.NeighborFinder.
 // Vectors are stored either as SQ8-quantized uint8 (sq8=true) or raw float32 (sq8=false);
@@ -81,50 +87,74 @@ type Searcher struct {
 	// pool recycles queryBuf instances across FindNearest calls, eliminating the
 	// per-query allocation of the centroid-search index and distance buffers.
 	pool sync.Pool
+	// mmapped is non-nil when the Searcher was opened via Open: it holds the mmap
+	// region so that vecFlat8 and labelFlat slices pointing into it remain valid.
+	// Released by Close. Nil when created with New (plain heap slices).
+	mmapped []byte
 }
 
-// Open reads a pre-built IVF index from path and returns a Searcher.
+// Open memory-maps the pre-built IVF index at path and returns a Searcher.
 // nprobe controls how many clusters are searched per query; values ≤ 0 use DefaultNprobe.
 // The file must have been produced by Build (cmd/preprocess with BUILD_IVF=true).
-// Whether SQ8 is active is encoded in the file header — no env var is needed at serve time.
+// Whether SQ8 is active is encoded in the file header — no env var needed at serve time.
 //
-// Binary format:
+// When sq8=true, vecFlat8 and labelFlat are sliced directly into the mmap region (zero-copy),
+// keeping ~45 MB out of Go's GC-managed heap and eliminating the double-buffering that the
+// previous os.ReadFile approach caused. Call Close when done to release the mmap.
+//
+// Binary format (flat layout, flagFlat always set):
 //
 //	[4B]                    uint32 LE: nlist
-//	[1B]                    uint8:     flags (bit 0 = SQ8 enabled; bits 1-7 reserved)
+//	[4B]                    uint32 LE: N (total vectors)
+//	[1B]                    uint8:     flags (bit 0=SQ8, bit 1=flat layout)
 //	If SQ8:
 //	  [VectorSize×4B]       float32 LE: sq8_min[VectorSize]
 //	  [VectorSize×4B]       float32 LE: sq8_scale[VectorSize]
 //	[nlist×VectorSize×4B]   float32 LE: centroids, row-major
-//	For each cluster 0..nlist-1:
-//	  [4B]                  uint32 LE: cluster_size
-//	  If SQ8:
-//	    [size×VectorSize B] uint8:     quantized vectors (1 byte/dim)
-//	  Else:
-//	    [size×VectorSize×4B] float32 LE: vectors (4 bytes/dim)
-//	  [size B]              uint8:     labels (1=fraud, 0=legit)
+//	[nlist×4B]              uint32 LE: sizes[nlist] (vectors per cluster)
+//	[N×VectorSize B]        uint8 (SQ8) or [N×VectorSize×4B] float32: flat vectors
+//	[N×1B]                  uint8: flat labels (1=fraud, 0=legit)
 func Open(path string, nprobe int, logger *zap.Logger) (*Searcher, error) {
-	data, err := os.ReadFile(path)
+	f, err := os.Open(path)
 	if err != nil {
 		return nil, fmt.Errorf("open %s: %w", path, err)
 	}
+	defer f.Close()
 
-	p := 0
-
-	if len(data) < 5 { // nlist(4) + flags(1)
+	info, err := f.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("stat %s: %w", path, err)
+	}
+	fileSize := int(info.Size())
+	if fileSize < 9 { // nlist(4) + N(4) + flags(1)
 		return nil, fmt.Errorf("%s: file too small", path)
 	}
+
+	// The mmap is kept alive in Searcher.mmapped so slices into it remain valid.
+	data, err := syscall.Mmap(int(f.Fd()), 0, fileSize, syscall.PROT_READ, syscall.MAP_SHARED)
+	if err != nil {
+		return nil, fmt.Errorf("mmap %s: %w", path, err)
+	}
+
+	p := 0
 	nlist := int(binary.LittleEndian.Uint32(data[p:]))
 	p += 4
-
+	n := int(binary.LittleEndian.Uint32(data[p:]))
+	p += 4
 	flags := data[p]
 	p++
+
+	if flags&flagFlat == 0 {
+		_ = syscall.Munmap(data)
+		return nil, fmt.Errorf("%s: old per-cluster format detected — regenerate with BUILD_IVF=true", path)
+	}
 	sq8 := flags&flagSQ8 != 0
 
 	var sq8Min, sq8Scale [domain.VectorSize]float32
 	if sq8 {
 		sq8ParamBytes := domain.VectorSize * 4 * 2
 		if p+sq8ParamBytes > len(data) {
+			_ = syscall.Munmap(data)
 			return nil, fmt.Errorf("%s: truncated at SQ8 params", path)
 		}
 		for d := 0; d < domain.VectorSize; d++ {
@@ -139,6 +169,7 @@ func Open(path string, nprobe int, logger *zap.Logger) (*Searcher, error) {
 
 	centroidBytes := nlist * domain.VectorSize * 4
 	if p+centroidBytes > len(data) {
+		_ = syscall.Munmap(data)
 		return nil, fmt.Errorf("%s: truncated at centroids", path)
 	}
 	centroids := make([]float32, nlist*domain.VectorSize)
@@ -147,55 +178,49 @@ func Open(path string, nprobe int, logger *zap.Logger) (*Searcher, error) {
 		p += 4
 	}
 
-	// vecBytesPerVec is the byte footprint of one vector in the inverted list.
+	sizesBytes := nlist * 4
+	if p+sizesBytes > len(data) {
+		_ = syscall.Munmap(data)
+		return nil, fmt.Errorf("%s: truncated at sizes", path)
+	}
+	sizes := make([]int32, nlist)
+	offsets := make([]int32, nlist)
+	var cum int32
+	for c := 0; c < nlist; c++ {
+		sz := int32(binary.LittleEndian.Uint32(data[p:]))
+		p += 4
+		offsets[c] = cum
+		sizes[c] = sz
+		cum += sz
+	}
+
 	vecBytesPerVec := domain.VectorSize // SQ8: 1 byte/dim
 	if !sq8 {
-		vecBytesPerVec = domain.VectorSize * 4 // float32: 4 bytes/dim
+		vecBytesPerVec = domain.VectorSize * 4
+	}
+	totalVecBytes := n * vecBytesPerVec
+	if p+totalVecBytes+n > len(data) {
+		_ = syscall.Munmap(data)
+		return nil, fmt.Errorf("%s: truncated at vectors/labels", path)
 	}
 
-	// First pass: accumulate sizes without copying vector data.
-	offsets := make([]int32, nlist)
-	sizes := make([]int32, nlist)
-	totalVecs := 0
-	scanPos := p
-	for c := 0; c < nlist; c++ {
-		if scanPos+4 > len(data) {
-			return nil, fmt.Errorf("%s: truncated at cluster %d header", path, c)
-		}
-		sz := int(binary.LittleEndian.Uint32(data[scanPos:]))
-		offsets[c] = int32(totalVecs)
-		sizes[c] = int32(sz)
-		totalVecs += sz
-		scanPos += 4 + sz*vecBytesPerVec + sz
-	}
-
-	// Second pass: copy cluster data into flat arrays.
 	var vecFlat8 []uint8
 	var vecFlat32 []float32
 	if sq8 {
-		vecFlat8 = make([]uint8, totalVecs*domain.VectorSize)
+		// Zero-copy: slice directly into the mmap region — no heap allocation.
+		vecFlat8 = data[p : p+totalVecBytes]
 	} else {
-		vecFlat32 = make([]float32, totalVecs*domain.VectorSize)
-	}
-	labelFlat := make([]uint8, totalVecs)
-
-	for c := 0; c < nlist; c++ {
-		sz := int(binary.LittleEndian.Uint32(data[p:]))
-		p += 4
-		off := int(offsets[c])
-		if sq8 {
-			copy(vecFlat8[off*domain.VectorSize:], data[p:p+sz*domain.VectorSize])
-			p += sz * domain.VectorSize
-		} else {
-			base := off * domain.VectorSize
-			for i := 0; i < sz*domain.VectorSize; i++ {
-				vecFlat32[base+i] = math.Float32frombits(binary.LittleEndian.Uint32(data[p:]))
-				p += 4
-			}
+		// float32 region may be unaligned; copy to a properly-aligned heap slice.
+		vecFlat32 = make([]float32, n*domain.VectorSize)
+		src := data[p : p+totalVecBytes]
+		for i := range vecFlat32 {
+			vecFlat32[i] = math.Float32frombits(binary.LittleEndian.Uint32(src[i*4:]))
 		}
-		copy(labelFlat[off:], data[p:p+sz])
-		p += sz
 	}
+	p += totalVecBytes
+
+	// Zero-copy: label slice directly into the mmap region.
+	labelFlat := data[p : p+n]
 
 	if nprobe <= 0 {
 		nprobe = DefaultNprobe
@@ -208,7 +233,7 @@ func Open(path string, nprobe int, logger *zap.Logger) (*Searcher, error) {
 		zap.Int("nlist", nlist),
 		zap.Int("nprobe", nprobe),
 		zap.Bool("sq8", sq8),
-		zap.Int("total_vectors", totalVecs),
+		zap.Int("total_vectors", n),
 	)
 
 	s := &Searcher{
@@ -223,10 +248,22 @@ func Open(path string, nprobe int, logger *zap.Logger) (*Searcher, error) {
 		labelFlat: labelFlat,
 		offsets:   offsets,
 		sizes:     sizes,
+		mmapped:   data,
 		logger:    logger,
 	}
 	s.initPool()
 	return s, nil
+}
+
+// Close releases the mmap region backing the Searcher's vector and label data.
+// It is a no-op when the Searcher was created with New (plain heap slices).
+// Must be called once the Searcher is no longer in use to avoid a resource leak.
+// Accessing the Searcher after Close results in undefined behaviour.
+func (s *Searcher) Close() error {
+	if s.mmapped == nil {
+		return nil
+	}
+	return syscall.Munmap(s.mmapped)
 }
 
 // initPool initialises the sync.Pool that recycles centroid-search buffers.

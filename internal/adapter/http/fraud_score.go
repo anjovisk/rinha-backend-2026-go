@@ -1,10 +1,11 @@
 package httphandler
 
 import (
-	"encoding/json"
+	"math"
 	"net/http"
 	"time"
 
+	"github.com/bytedance/sonic"
 	"go.uber.org/zap"
 
 	"anjovisk/fraud-detection/internal/domain"
@@ -64,6 +65,18 @@ type fraudScoreResponse struct {
 	FraudScore float64 `json:"fraud_score"`
 }
 
+// fraudResponses holds the six possible pre-encoded JSON responses indexed by fraud count (0–5).
+// FraudScore = fraudCount / 5 has exactly six values: 0, 0.2, 0.4, 0.6, 0.8, 1.
+// Serving a static []byte avoids json.Encoder allocation and reflection on every request.
+var fraudResponses = [6][]byte{
+	[]byte("{\"approved\":true,\"fraud_score\":0}\n"),
+	[]byte("{\"approved\":true,\"fraud_score\":0.2}\n"),
+	[]byte("{\"approved\":true,\"fraud_score\":0.4}\n"),
+	[]byte("{\"approved\":false,\"fraud_score\":0.6}\n"),
+	[]byte("{\"approved\":false,\"fraud_score\":0.8}\n"),
+	[]byte("{\"approved\":false,\"fraud_score\":1}\n"),
+}
+
 // handleFraudScore handles POST /fraud-score requests.
 // It decodes the JSON body into a fraudScoreRequest, delegates evaluation to the
 // fraud use case, and serialises the result as JSON.
@@ -73,7 +86,7 @@ type fraudScoreResponse struct {
 // than false positives.
 func (s *Server) handleFraudScore(w http.ResponseWriter, r *http.Request) {
 	var payload fraudScoreRequest
-	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+	if err := sonic.ConfigDefault.NewDecoder(r.Body).Decode(&payload); err != nil {
 		s.logger.Debug("failed to decode request body",
 			zap.Error(err),
 			zap.String("remote_addr", r.RemoteAddr),
@@ -95,7 +108,7 @@ func (s *Server) handleFraudScore(w http.ResponseWriter, r *http.Request) {
 			zap.Error(err),
 		)
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(fraudScoreResponse{Approved: true, FraudScore: 0.0})
+		_, _ = w.Write(fraudResponses[0])
 		return
 	}
 
@@ -104,11 +117,16 @@ func (s *Server) handleFraudScore(w http.ResponseWriter, r *http.Request) {
 		zap.Bool("approved", result.Approved),
 		zap.Float64("fraud_score", result.FraudScore),
 	)
+
+	// FraudScore = fraudCount / 5; index is the integer fraud count (0–5).
+	fraudIdx := int(math.Round(result.FraudScore * 5))
+	if fraudIdx < 0 {
+		fraudIdx = 0
+	} else if fraudIdx > 5 {
+		fraudIdx = 5
+	}
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(fraudScoreResponse{
-		Approved:   result.Approved,
-		FraudScore: result.FraudScore,
-	})
+	_, _ = w.Write(fraudResponses[fraudIdx])
 }
 
 // toDomain converts the HTTP payload into the domain request model consumed by the use case.
