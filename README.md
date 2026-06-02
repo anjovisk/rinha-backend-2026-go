@@ -487,6 +487,58 @@ A tabela cobre as combinações mais relevantes para N = 3.000.000, D = 14, `IVF
 
 > **Impacto do nlist no recall a % fixo:** para 3,13% do dataset escaneado, o recall varia de ~80% (nlist=512) a ~94% (nlist=2048) a ~91% (nlist=4096). O ponto ótimo é nlist=2048 — clusters mais coesos que nlist=512/1024, sem o custo de build de nlist=4096.
 
+#### Ranqueamento de configurações HNSW flat
+
+O HNSW flat visita muito menos vetores que o IVF (acesso logarítmico vs linear), mas cada nó custa mais por acesso aleatório ao mmap (~100 ns de cache miss vs ~2 ns de scan sequencial). A latência é portanto dominada por dois fatores: **`HNSWFLAT_M`** determina a memória e a conectividade do grafo (fixa para todas as queries), e **`HNSWFLAT_EF`** controla o número de nós visitados por query (ajustável em runtime sem rebuild).
+
+**Memória por instância** depende exclusivamente de M:
+
+| M | layer-0 adj | Upper CSR | SQ8 vecs | labels+levels | **Total mmap** | **RSS/instância** |
+|---|:---:|:---:|:---:|:---:|:---:|:---:|
+| M=3 | ~72 MB | ~23 MB | ~42 MB | ~6 MB | ~143 MB | **~158 MB** — cabe em 165 MB |
+| M=4 | ~96 MB | ~27 MB | ~42 MB | ~6 MB | ~166 MB⁺ | **~181 MB⁺** — excede 165 MB |
+
+⁺ M=4 requer 1 instância (memory: "200MB") ou limite Docker superior a 181 MB.
+
+A tabela abaixo assume `HNSWFLAT_SQ8=true`, N = 3.000.000, D = 14. A **latência estimada** inclui nós visitados × ~0,10 µs (acesso aleatório ao mmap + distância SQ8) + ~300 µs base (HTTP/JSON + overhead de heap e níveis).
+
+| # | `HNSWFLAT_M` | `HNSWFLAT_EF` | Nós visitados/query | RSS/instância | Speedup vs brute | Recall k=5 (est.) | Latência est. | Build (`HNSWFLAT_EF_BUILD`) |
+|---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+| 1 | 3 | 10 | ~90 | ~158 MB | ~44× | ~82% | ~310 µs | ~5 min (100) |
+| 2 | 3 | 20 | ~180 | ~158 MB | ~22× | ~88% | ~320 µs | ~5 min (100) |
+| **3 ★** | **3** | **50** | **~450** | **~158 MB** | **~9×** | **~93%** | **~345 µs** | **~5 min (100)** |
+| 4 | 3 | 100 | ~900 | ~158 MB | ~4× | ~96% | ~390 µs | ~5 min (100) |
+| 5 | 3 | 200 | ~1800 | ~158 MB | ~2× | ~98% | ~480 µs | ~5 min (100) |
+| 6 | 3 | 50 | ~450 | ~158 MB | ~9× | ~95% | ~345 µs | ~10 min (200) |
+| 7 | 3 | 50 | ~450 | ~158 MB | ~9× | ~96% | ~345 µs | ~15 min (300) |
+| 8 | 3 | 100 | ~900 | ~158 MB | ~4× | ~98% | ~390 µs | ~15 min (300) |
+| 9 | 4 | 20 | ~240 | ~181 MB⁺ | ~17× | ~91% | ~325 µs | ~8 min (100) |
+| **10 ★** | **4** | **50** | **~600** | **~181 MB⁺** | **~7×** | **~95%** | **~360 µs** | **~8 min (100)** |
+| 11 | 4 | 100 | ~1200 | ~181 MB⁺ | ~3× | ~97% | ~420 µs | ~8 min (100) |
+| 12 | 4 | 50 | ~600 | ~181 MB⁺ | ~7× | ~97% | ~360 µs | ~16 min (200) |
+
+**Recall:** fração estimada de queries em que o top-5 exato é recuperado. Com D=14 (baixa dimensionalidade), o HNSW atinge bons recalls com ef moderado; valores dependem do dataset — valide com benchmark local. `HNSWFLAT_EF` é configurável em runtime sem rebuild; `HNSWFLAT_EF_BUILD` afeta apenas a qualidade do grafo (maior = grafo melhor = mesmo ef_search com mais recall).
+
+**Build:** estimativas para 8 CPUs com N=3M. O build é paralelo mas dominado por acessos aleatórios ao mmap de referências (~100 ns/acesso). M maior e ef_build maior aumentam o tempo proporcionalmente.
+
+**Análise por critério da competição:**
+
+| Critério | Config | Justificativa |
+|----------|--------|---------------|
+| Menor latência | #1 M=3/ef=10 | ~310 µs; recall ~82% — risco de corte de detecção |
+| Menor latência com recall seguro (≥88%) | #2 M=3/ef=20 | ~320 µs; recall ~88% |
+| **Melhor balanço geral M=3 ★** | **#3 M=3/ef=50 (ef_build=100)** | **~345 µs; recall ~93%; cabe em 165 MB** |
+| Melhor recall sem rebuild | #4 M=3/ef=100 | ~390 µs; recall ~96%; só HNSWFLAT_EF muda |
+| Mesmo tempo, mais recall | #7 M=3/ef=50 (ef_build=300) | mesma latência que #3, recall ~96% com build mais longo |
+| Alto recall (≥98%) dentro de p99 ≤ 1 ms | #8 M=3/ef=100 (ef_build=300) | ~390 µs; recall ~98% |
+| **Melhor balanço M=4 ★** | **#10 M=4/ef=50 (ef_build=100)** | **~360 µs; recall ~95%; requer limite > 165 MB** |
+
+> **HNSW flat vs IVF:** a config padrão M=3/ef=50 (latência ~345 µs, recall ~93%) é ~20% mais rápida que a config IVF ★ (nlist=2048/nprobe=64, ~437 µs, ~94% recall), ao custo de build mais longo. O ganho vem da natureza O(log N) do HNSW vs O(nprobe·N/nlist) do IVF.
+
+> **p99 ≤ 1 ms:** todas as configurações da tabela operam bem abaixo de 1 ms. Mesmo a #8 (~480 µs) tem folga de ~520 µs — ao contrário do IVF onde configs de alta recall se aproximam do limiar.
+
+> **`HNSWFLAT_EF` vs `HNSWFLAT_EF_BUILD`:** ef_build é fixo por imagem Docker; ef_search é variável em runtime. Para explorar o espaço recall/latência sem rebuild, use configs #1–#5 e ajuste apenas `HNSWFLAT_EF` no `.env`.
+
 ### Rodar a aplicação
 
 ```bash
