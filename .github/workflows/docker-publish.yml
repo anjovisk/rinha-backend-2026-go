@@ -1,0 +1,61 @@
+name: Publica imagem Docker
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  docker:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configura Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login no Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Extrai metadados da imagem
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ secrets.DOCKERHUB_USERNAME }}/rinha-backend-2026-go
+          tags: |
+            type=sha,prefix=,format=short
+            type=raw,value=latest
+
+      - name: Build e push da imagem
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VECTOR_SEARCHER=${{ vars.VECTOR_SEARCHER || 'hnswflat' }}
+            BUILD_HNSW=${{ vars.BUILD_HNSW || 'false' }}
+            BUILD_IVF=${{ vars.BUILD_IVF || 'false' }}
+            IVF_NLIST=${{ vars.IVF_NLIST || '2048' }}
+            IVF_SQ8=${{ vars.IVF_SQ8 || 'true' }}
+            BUILD_VAMANA=${{ vars.BUILD_VAMANA || 'false' }}
+            VAMANA_R=${{ vars.VAMANA_R || '16' }}
+            VAMANA_BUILD_L=${{ vars.VAMANA_BUILD_L || '0' }}
+            VAMANA_ALPHA=${{ vars.VAMANA_ALPHA || '1.2' }}
+            VAMANA_SQ8=${{ vars.VAMANA_SQ8 || 'true' }}
+            BUILD_HNSWFLAT=${{ vars.BUILD_HNSWFLAT || 'true' }}
+            HNSWFLAT_M=${{ vars.HNSWFLAT_M || '3' }}
+            HNSWFLAT_M0=${{ vars.HNSWFLAT_M0 || '20' }}
+            HNSWFLAT_EF_BUILD=${{ vars.HNSWFLAT_EF_BUILD || '100' }}
+            HNSWFLAT_REFINE=${{ vars.HNSWFLAT_REFINE || 'true' }}
+            HNSWFLAT_SQ8=${{ vars.HNSWFLAT_SQ8 || 'true' }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
