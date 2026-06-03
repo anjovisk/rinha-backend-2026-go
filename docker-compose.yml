@@ -28,6 +28,7 @@ services:
     build:
       context: .
       args:
+        VECTOR_SEARCHER: ${VECTOR_SEARCHER:-hnswflat}
         BUILD_HNSW: ${BUILD_HNSW:-false}
         BUILD_IVF: ${BUILD_IVF:-false}
         IVF_NLIST: ${IVF_NLIST:-1024}
@@ -37,7 +38,7 @@ services:
         VAMANA_BUILD_L: ${VAMANA_BUILD_L:-0}
         VAMANA_ALPHA: ${VAMANA_ALPHA:-1.2}
         VAMANA_SQ8: ${VAMANA_SQ8:-true}
-        BUILD_HNSWFLAT: ${BUILD_HNSWFLAT:-false}
+        BUILD_HNSWFLAT: ${BUILD_HNSWFLAT:-true}
         HNSWFLAT_M: ${HNSWFLAT_M:-3}
         HNSWFLAT_M0: ${HNSWFLAT_M0:-0}
         HNSWFLAT_EF_BUILD: ${HNSWFLAT_EF_BUILD:-100}
@@ -51,7 +52,7 @@ services:
     restart: unless-stopped
     environment:
       - LOG_LEVEL=${LOG_LEVEL:-error}
-      - VECTOR_SEARCHER=${VECTOR_SEARCHER:-brute}
+      - VECTOR_SEARCHER=${VECTOR_SEARCHER:-hnswflat}
       - IVF_NPROBE=${IVF_NPROBE:-32}
       - VAMANA_L=${VAMANA_L:-64}
       - HNSWFLAT_EF=${HNSWFLAT_EF:-50}
@@ -67,6 +68,7 @@ services:
     build:
       context: .
       args:
+        VECTOR_SEARCHER: ${VECTOR_SEARCHER:-hnswflat}
         BUILD_HNSW: ${BUILD_HNSW:-false}
         BUILD_IVF: ${BUILD_IVF:-false}
         IVF_NLIST: ${IVF_NLIST:-1024}
@@ -76,7 +78,7 @@ services:
         VAMANA_BUILD_L: ${VAMANA_BUILD_L:-0}
         VAMANA_ALPHA: ${VAMANA_ALPHA:-1.2}
         VAMANA_SQ8: ${VAMANA_SQ8:-true}
-        BUILD_HNSWFLAT: ${BUILD_HNSWFLAT:-false}
+        BUILD_HNSWFLAT: ${BUILD_HNSWFLAT:-true}
         HNSWFLAT_M: ${HNSWFLAT_M:-3}
         HNSWFLAT_M0: ${HNSWFLAT_M0:-0}
         HNSWFLAT_EF_BUILD: ${HNSWFLAT_EF_BUILD:-100}
@@ -90,7 +92,7 @@ services:
     restart: unless-stopped
     environment:
       - LOG_LEVEL=${LOG_LEVEL:-error}
-      - VECTOR_SEARCHER=${VECTOR_SEARCHER:-brute}
+      - VECTOR_SEARCHER=${VECTOR_SEARCHER:-hnswflat}
       - IVF_NPROBE=${IVF_NPROBE:-32}
       - VAMANA_L=${VAMANA_L:-64}
       - HNSWFLAT_EF=${HNSWFLAT_EF:-50}
