@@ -1,0 +1,61 @@
+services:
+  nginx:
+    image: nginx:alpine
+    platform: linux/amd64
+    ports:
+      - "9999:9999"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - api-1
+      - api-2
+    networks:
+      - api-network
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "0.20"
+          memory: "20MB"
+
+  api-1:
+    image: anjovisk/rinha-backend-2026-go:latest
+    platform: linux/amd64
+    networks:
+      - api-network
+    restart: unless-stopped
+    environment:
+      - LOG_LEVEL=error
+      - VECTOR_SEARCHER=hnswflat
+      - HNSWFLAT_EF=100
+      - GOMEMLIMIT=135MiB
+      - GOMAXPROCS=1
+    deploy:
+      resources:
+        limits:
+          cpus: "0.40"
+          memory: "165MB"
+
+  api-2:
+    image: anjovisk/rinha-backend-2026-go:latest
+    platform: linux/amd64
+    networks:
+      - api-network
+    restart: unless-stopped
+    environment:
+      - LOG_LEVEL=error
+      - VECTOR_SEARCHER=hnswflat
+      - HNSWFLAT_EF=100
+      - GOMEMLIMIT=135MiB
+      - GOMAXPROCS=1
+    deploy:
+      resources:
+        limits:
+          cpus: "0.40"
+          memory: "165MB"
+
+networks:
+  api-network:
+    driver: bridge
+
+# Totais: 1.0 CPU | 350 MB
