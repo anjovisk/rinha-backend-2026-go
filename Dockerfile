@@ -14,13 +14,10 @@ COPY . .
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
     go build -ldflags="-w -s" -o server ./cmd/server
 
-# Convert references.json.gz → references.bin.
-# When BUILD_HNSW=true, also builds references.hnsw (pre-built HNSW graph for
-# fast startup with VECTOR_SEARCHER=hnsw). Adds several minutes to image build time.
-# When BUILD_IVF=true, also builds references.ivf (IVF-SQ8 index for
-# fast startup with VECTOR_SEARCHER=ivf). IVF_NLIST controls cluster count (default 1024).
-# When BUILD_HNSWFLAT=true, builds references.hnswflat (flat mmap HNSW for
-# VECTOR_SEARCHER=hnswflat). HNSWFLAT_M=3 SQ8 → ~143 MB mmap, ~158 MB RSS.
+# Convert references.json.gz → references.bin and build the index for VECTOR_SEARCHER.
+# Each BUILD_* flag is ignored when VECTOR_SEARCHER does not match the corresponding
+# searcher — only the active searcher's index is built.
+ARG VECTOR_SEARCHER=hnswflat
 ARG BUILD_HNSW=false
 ARG BUILD_IVF=false
 ARG IVF_NLIST=1024
@@ -30,13 +27,14 @@ ARG VAMANA_R=16
 ARG VAMANA_BUILD_L=0
 ARG VAMANA_ALPHA=1.2
 ARG VAMANA_SQ8=true
-ARG BUILD_HNSWFLAT=false
+ARG BUILD_HNSWFLAT=true
 ARG HNSWFLAT_M=3
 ARG HNSWFLAT_M0=0
 ARG HNSWFLAT_EF_BUILD=100
 ARG HNSWFLAT_REFINE=true
 ARG HNSWFLAT_SQ8=true
-RUN BUILD_HNSW=${BUILD_HNSW} BUILD_IVF=${BUILD_IVF} IVF_NLIST=${IVF_NLIST} IVF_SQ8=${IVF_SQ8} \
+RUN VECTOR_SEARCHER=${VECTOR_SEARCHER} \
+    BUILD_HNSW=${BUILD_HNSW} BUILD_IVF=${BUILD_IVF} IVF_NLIST=${IVF_NLIST} IVF_SQ8=${IVF_SQ8} \
     BUILD_VAMANA=${BUILD_VAMANA} VAMANA_R=${VAMANA_R} VAMANA_BUILD_L=${VAMANA_BUILD_L} \
     VAMANA_ALPHA=${VAMANA_ALPHA} VAMANA_SQ8=${VAMANA_SQ8} \
     BUILD_HNSWFLAT=${BUILD_HNSWFLAT} HNSWFLAT_M=${HNSWFLAT_M} HNSWFLAT_M0=${HNSWFLAT_M0} \

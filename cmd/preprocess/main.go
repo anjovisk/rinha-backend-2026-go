@@ -129,28 +129,42 @@ func main() {
 
 	log.Printf("done: %d entries → %s", count, outPath)
 
-	if os.Getenv("BUILD_HNSW") == "true" {
-		buildHNSW(outPath, count)
-	} else {
+	searcher := os.Getenv("VECTOR_SEARCHER")
+
+	switch {
+	case os.Getenv("BUILD_HNSW") != "true":
 		log.Printf("skipping HNSW index build (BUILD_HNSW != true)")
+	case searcher != "hnsw":
+		log.Printf("skipping HNSW index build (VECTOR_SEARCHER=%q)", searcher)
+	default:
+		buildHNSW(outPath, count)
 	}
 
-	if os.Getenv("BUILD_IVF") == "true" {
-		buildIVF(outPath)
-	} else {
+	switch {
+	case os.Getenv("BUILD_IVF") != "true":
 		log.Printf("skipping IVF-SQ8 index build (BUILD_IVF != true)")
+	case searcher != "ivf":
+		log.Printf("skipping IVF-SQ8 index build (VECTOR_SEARCHER=%q)", searcher)
+	default:
+		buildIVF(outPath)
 	}
 
-	if os.Getenv("BUILD_VAMANA") == "true" {
-		buildVamana(outPath)
-	} else {
+	switch {
+	case os.Getenv("BUILD_VAMANA") != "true":
 		log.Printf("skipping Vamana index build (BUILD_VAMANA != true)")
+	case searcher != "vamana":
+		log.Printf("skipping Vamana index build (VECTOR_SEARCHER=%q)", searcher)
+	default:
+		buildVamana(outPath)
 	}
 
-	if os.Getenv("BUILD_HNSWFLAT") == "true" {
-		buildHNSWFlat(outPath)
-	} else {
+	switch {
+	case os.Getenv("BUILD_HNSWFLAT") != "true":
 		log.Printf("skipping HNSW-flat index build (BUILD_HNSWFLAT != true)")
+	case searcher != "hnswflat":
+		log.Printf("skipping HNSW-flat index build (VECTOR_SEARCHER=%q)", searcher)
+	default:
+		buildHNSWFlat(outPath)
 	}
 }
 
