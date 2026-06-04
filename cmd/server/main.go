@@ -21,6 +21,9 @@
 //	VECTOR_SEARCHER=hnswflathybrid  hnswflat for unambiguous scores (0.0 or 1.0); partition fallback
 //	                                for borderline scores — guarantees exact decision accuracy.
 //	                                Requires references.hnswflat and references.bin.
+//	VECTOR_SEARCHER=simdbrute  partition routing + AVX2-accelerated distance computation.
+//	                           Exact within each bin; ~4–8× faster distance kernel than partition.
+//	                           Requires AMD64 with AVX2 (Haswell+). No separate index file needed.
 //
 // IVF tuning knobs (only when VECTOR_SEARCHER=ivf):
 //
@@ -59,6 +62,7 @@ import (
 	"anjovisk/fraud-detection/internal/adapter/ivf"
 	"anjovisk/fraud-detection/internal/adapter/knn"
 	"anjovisk/fraud-detection/internal/adapter/partition"
+	"anjovisk/fraud-detection/internal/adapter/simdbrute"
 	"anjovisk/fraud-detection/internal/adapter/vamana"
 	"anjovisk/fraud-detection/internal/adapter/vector"
 	"anjovisk/fraud-detection/internal/adapter/vptree"
@@ -271,6 +275,13 @@ func buildNeighborFinder(kind string, logger *zap.Logger) port.NeighborFinder {
 		s, err := vptree.Open(refsPath, logger)
 		if err != nil {
 			logger.Fatal("failed to build VP-Tree index", zap.Error(err))
+		}
+		return s
+	case "simdbrute":
+		logger.Info("neighbor finder: simdbrute (partition routing + AVX2 distance)")
+		s, err := simdbrute.Open(refsPath, logger)
+		if err != nil {
+			logger.Fatal("failed to open simdbrute index", zap.Error(err))
 		}
 		return s
 	case "hnswflathybrid":
