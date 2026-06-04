@@ -34,7 +34,7 @@ services:
       resources:
         limits:
           cpus: "0.35"
-          memory: "160MB"
+          memory: "155MB"
 
   api-2:
     image: anjovisk/rinha-backend-2026-go:latest
@@ -52,7 +52,7 @@ services:
       resources:
         limits:
           cpus: "0.35"
-          memory: "160MB"
+          memory: "155MB"
 
 networks:
   api-network:
