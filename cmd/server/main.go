@@ -18,6 +18,9 @@
 //	                           selected by (last_tx_null × is_online × card_present), scanning
 //	                           ~31% of the dataset on average (~3.2× speedup over brute).
 //	                           Exact within each partition; no separate index file required.
+//	VECTOR_SEARCHER=hnswflathybrid  hnswflat for unambiguous scores (0.0 or 1.0); partition fallback
+//	                                for borderline scores — guarantees exact decision accuracy.
+//	                                Requires references.hnswflat and references.bin.
 //
 // IVF tuning knobs (only when VECTOR_SEARCHER=ivf):
 //
@@ -52,6 +55,7 @@ import (
 	httphandler "anjovisk/fraud-detection/internal/adapter/http"
 	"anjovisk/fraud-detection/internal/adapter/hnsw"
 	"anjovisk/fraud-detection/internal/adapter/hnswflat"
+	"anjovisk/fraud-detection/internal/adapter/hybrid"
 	"anjovisk/fraud-detection/internal/adapter/ivf"
 	"anjovisk/fraud-detection/internal/adapter/knn"
 	"anjovisk/fraud-detection/internal/adapter/partition"
@@ -269,6 +273,28 @@ func buildNeighborFinder(kind string, logger *zap.Logger) port.NeighborFinder {
 			logger.Fatal("failed to build VP-Tree index", zap.Error(err))
 		}
 		return s
+	case "hnswflathybrid":
+		efSearch := hnswflat.DefaultEfSearch
+		if raw := os.Getenv("HNSWFLAT_EF"); raw != "" {
+			if n, err := strconv.Atoi(raw); err == nil && n > 0 {
+				efSearch = n
+			}
+		}
+		logger.Info("neighbor finder: hnswflathybrid (hnswflat + partition fallback)",
+			zap.String("index_path", hnswflatPath),
+			zap.Int("ef_search", efSearch),
+		)
+		fast, err := hnswflat.Open(hnswflatPath, efSearch, logger.Named("hnswflat"))
+		if err != nil {
+			logger.Fatal("failed to load HNSW-flat index — run preprocess with BUILD_HNSWFLAT=true",
+				zap.Error(err),
+			)
+		}
+		exact, err := partition.Open(refsPath, logger.Named("partition"))
+		if err != nil {
+			logger.Fatal("failed to open partition index", zap.Error(err))
+		}
+		return hybrid.New(fast, exact, logger.Named("hybrid"))
 	default:
 		logger.Info("neighbor finder: brute-force (exact)", zap.String("vector_searcher", kind))
 		s, err := knn.Open(refsPath, logger)

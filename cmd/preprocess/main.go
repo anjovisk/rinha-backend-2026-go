@@ -161,7 +161,7 @@ func main() {
 	switch {
 	case os.Getenv("BUILD_HNSWFLAT") != "true":
 		log.Printf("skipping HNSW-flat index build (BUILD_HNSWFLAT != true)")
-	case searcher != "hnswflat":
+	case searcher != "hnswflat" && searcher != "hnswflathybrid":
 		log.Printf("skipping HNSW-flat index build (VECTOR_SEARCHER=%q)", searcher)
 	default:
 		buildHNSWFlat(outPath)
