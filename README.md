@@ -775,7 +775,7 @@ BUILD_HNSWFLAT=true VECTOR_SEARCHER=hnswflathybrid docker compose up --build
 VECTOR_SEARCHER=simdbrute docker compose up --build
 
 # Qdrant: KNN delegado ao Qdrant; vetores inseridos na 1ª inicialização e persistidos
-VECTOR_SEARCHER=qdrant docker compose --profile qdrant up --build
+VECTOR_SEARCHER=qdrant docker compose up --build
 
 # A API fica disponível em http://localhost:9999 (via nginx)
 # Acesso direto às instâncias: http://localhost:8080 e http://localhost:8081
@@ -783,21 +783,21 @@ VECTOR_SEARCHER=qdrant docker compose --profile qdrant up --build
 
 ### Qdrant
 
-O Qdrant é ativado via Docker Compose profile. Na primeira inicialização as APIs inserem todos os 3M vetores de referência na collection Qdrant (pode levar alguns minutos). Nas reinicializações seguintes a collection já existe no volume e o startup é imediato.
+O serviço Qdrant sobe junto com o stack. Na primeira inicialização as APIs inserem todos os 3M vetores de referência na collection Qdrant (pode levar alguns minutos). Nas reinicializações seguintes a collection já existe no volume e o startup é imediato.
 
 ```bash
 # Primeira vez: build + carga de dados (alguns minutos)
-VECTOR_SEARCHER=qdrant docker compose --profile qdrant up --build
+VECTOR_SEARCHER=qdrant docker compose up --build
 
 # Reinicializações seguintes: startup imediato
-VECTOR_SEARCHER=qdrant docker compose --profile qdrant up
+VECTOR_SEARCHER=qdrant docker compose up
 
 # Busca exata (sem HNSW, mais lenta mas 100% de recall)
-VECTOR_SEARCHER=qdrant QDRANT_EXACT=true docker compose --profile qdrant up
+VECTOR_SEARCHER=qdrant QDRANT_EXACT=true docker compose up
 
 # Remover os dados e recarregar do zero
 docker compose down -v
-VECTOR_SEARCHER=qdrant docker compose --profile qdrant up --build
+VECTOR_SEARCHER=qdrant docker compose up --build
 ```
 
 **Orçamento de recursos com Qdrant** (total 1 CPU / 350 MB):

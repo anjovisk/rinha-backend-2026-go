@@ -119,11 +119,11 @@ services:
           memory: "150MB"
 
   # ── qdrant ────────────────────────────────────────────────────────────────────
-  # Ativo apenas com: docker compose --profile qdrant up
-  # Vetores de referência são inseridos na primeira inicialização das APIs e
-  # persistidos em qdrant_storage. Reinicializações subsequentes saltam a carga.
+  # Necessário quando VECTOR_SEARCHER=qdrant. Vetores de referência são inseridos
+  # na primeira inicialização das APIs e persistidos em qdrant_storage.
+  # Reinicializações subsequentes saltam a carga (collection já existe).
   #
-  # Orçamento alternativo com VECTOR_SEARCHER=qdrant (total 1 CPU / 350 MB):
+  # Orçamento com VECTOR_SEARCHER=qdrant (total 1 CPU / 350 MB):
   #   nginx  0.10 CPU  20 MB
   #   qdrant 0.50 CPU 270 MB  (HNSW + quantização int8 ~250 MB para 3M vetores × 14 dims)
   #   api-1  0.20 CPU  30 MB  (sem índice local — só HTTP + vetorização)
@@ -131,7 +131,6 @@ services:
   qdrant:
     image: qdrant/qdrant:latest
     platform: linux/amd64
-    profiles: ["qdrant"]
     volumes:
       - qdrant_storage:/qdrant/storage
     networks:
@@ -156,5 +155,5 @@ networks:
 volumes:
   qdrant_storage:
 
-# Totais padrão (hnswflat): 1.0 CPU | 350 MB
-# Totais com --profile qdrant: 1.0 CPU | 350 MB
+# Totais padrão (hnswflat): 1.0 CPU | 350 MB (qdrant sobe mas fica idle)
+# Totais com VECTOR_SEARCHER=qdrant: 1.0 CPU | 350 MB (conforme orçamento acima)
