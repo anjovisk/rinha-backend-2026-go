@@ -65,6 +65,9 @@ As dependências fluem sempre para dentro: adapters conhecem ports, ports conhec
 | `internal/adapter/partition` | Adapter secundário | Busca exata particionada; roteia cada query para um dos 6 sub-índices por `(last_tx_null × is_online × card_present)`; ~3,2× mais rápido que brute sem arquivo de índice extra; selecionado por `VECTOR_SEARCHER=partition` |
 | `internal/adapter/vptree` | Adapter secundário | VP-Tree exato por bin; mesma partição do `partition` + poda pela desigualdade triangular; construído no startup em O(N log N); selecionado por `VECTOR_SEARCHER=vptree` |
 | `internal/adapter/hnswflat` | Adapter secundário | HNSW multi-camada aproximado O(log N) com grafo flat mmap; SQ8 + adjacência zero-copy; construção paralela com `selectNeighborsHeuristic` (keepPrunedConnections + extendCandidates) e passagem de refinamento layer-0; selecionado por `VECTOR_SEARCHER=hnswflat` |
+| `internal/adapter/hybrid` | Adapter secundário | Compõe hnswflat + partition; usa hnswflat para scores 0.0/1.0 (inequívocos) e partition (exato) para 0.2–0.8 (borderline); ~100% de acurácia de decisão; selecionado por `VECTOR_SEARCHER=hnswflathybrid` |
+| `internal/adapter/simdbrute` | Adapter secundário | Mesmo roteamento de partição do `partition` com kernel de distância AVX2 (8 floats/ciclo); ~4–8× mais rápido que o scalar; exige AVX2 (Intel Haswell+); selecionado por `VECTOR_SEARCHER=simdbrute` |
+| `internal/adapter/qdrant` | Adapter secundário | Delega KNN ao Qdrant via REST; vetores inseridos na primeira inicialização e persistidos em volume; HNSW interno com quantização int8; selecionado por `VECTOR_SEARCHER=qdrant` |
 
 ## Stack
 
@@ -765,9 +768,46 @@ BUILD_HNSWFLAT=true VECTOR_SEARCHER=hnswflat docker compose up --build
 # HNSW flat com ef_search maior em runtime (melhor recall, sem rebuild)
 BUILD_HNSWFLAT=true VECTOR_SEARCHER=hnswflat HNSWFLAT_EF=100 docker compose up --build
 
+# HNSW-flat hybrid: hnswflat para scores inequívocos, partition para borderline
+BUILD_HNSWFLAT=true VECTOR_SEARCHER=hnswflathybrid docker compose up --build
+
+# SIMD brute: partition routing + kernel AVX2 (exige AVX2, sem preprocess extra)
+VECTOR_SEARCHER=simdbrute docker compose up --build
+
+# Qdrant: KNN delegado ao Qdrant; vetores inseridos na 1ª inicialização e persistidos
+VECTOR_SEARCHER=qdrant docker compose --profile qdrant up --build
+
 # A API fica disponível em http://localhost:9999 (via nginx)
 # Acesso direto às instâncias: http://localhost:8080 e http://localhost:8081
 ```
+
+### Qdrant
+
+O Qdrant é ativado via Docker Compose profile. Na primeira inicialização as APIs inserem todos os 3M vetores de referência na collection Qdrant (pode levar alguns minutos). Nas reinicializações seguintes a collection já existe no volume e o startup é imediato.
+
+```bash
+# Primeira vez: build + carga de dados (alguns minutos)
+VECTOR_SEARCHER=qdrant docker compose --profile qdrant up --build
+
+# Reinicializações seguintes: startup imediato
+VECTOR_SEARCHER=qdrant docker compose --profile qdrant up
+
+# Busca exata (sem HNSW, mais lenta mas 100% de recall)
+VECTOR_SEARCHER=qdrant QDRANT_EXACT=true docker compose --profile qdrant up
+
+# Remover os dados e recarregar do zero
+docker compose down -v
+VECTOR_SEARCHER=qdrant docker compose --profile qdrant up --build
+```
+
+**Orçamento de recursos com Qdrant** (total 1 CPU / 350 MB):
+
+| Serviço | CPU | RAM |
+|---------|-----|-----|
+| nginx   | 0.10 | 20 MB |
+| qdrant  | 0.50 | 270 MB |
+| api-1   | 0.20 | 30 MB |
+| api-2   | 0.20 | 30 MB |
 
 Para rebuild da imagem sem cache:
 

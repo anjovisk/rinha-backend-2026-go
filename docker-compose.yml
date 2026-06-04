@@ -58,6 +58,13 @@ services:
       - HNSWFLAT_EF=${HNSWFLAT_EF:-50}
       - GOMEMLIMIT=${GOMEMLIMIT:-135MiB}
       - GOMAXPROCS=1
+      - QDRANT_URL=${QDRANT_URL:-http://qdrant:6333}
+      - QDRANT_COLLECTION=${QDRANT_COLLECTION:-references}
+      - QDRANT_EXACT=${QDRANT_EXACT:-false}
+    depends_on:
+      qdrant:
+        condition: service_healthy
+        required: false
     deploy:
       resources:
         limits:
@@ -98,14 +105,56 @@ services:
       - HNSWFLAT_EF=${HNSWFLAT_EF:-50}
       - GOMEMLIMIT=${GOMEMLIMIT:-135MiB}
       - GOMAXPROCS=1
+      - QDRANT_URL=${QDRANT_URL:-http://qdrant:6333}
+      - QDRANT_COLLECTION=${QDRANT_COLLECTION:-references}
+      - QDRANT_EXACT=${QDRANT_EXACT:-false}
+    depends_on:
+      qdrant:
+        condition: service_healthy
+        required: false
     deploy:
       resources:
         limits:
           cpus: "0.35"
           memory: "150MB"
 
+  # ── qdrant ────────────────────────────────────────────────────────────────────
+  # Ativo apenas com: docker compose --profile qdrant up
+  # Vetores de referência são inseridos na primeira inicialização das APIs e
+  # persistidos em qdrant_storage. Reinicializações subsequentes saltam a carga.
+  #
+  # Orçamento alternativo com VECTOR_SEARCHER=qdrant (total 1 CPU / 350 MB):
+  #   nginx  0.10 CPU  20 MB
+  #   qdrant 0.50 CPU 270 MB  (HNSW + quantização int8 ~250 MB para 3M vetores × 14 dims)
+  #   api-1  0.20 CPU  30 MB  (sem índice local — só HTTP + vetorização)
+  #   api-2  0.20 CPU  30 MB
+  qdrant:
+    image: qdrant/qdrant:latest
+    platform: linux/amd64
+    profiles: ["qdrant"]
+    volumes:
+      - qdrant_storage:/qdrant/storage
+    networks:
+      - api-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:6333/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          cpus: "0.50"
+          memory: "270MB"
+
 networks:
   api-network:
     driver: bridge
 
-# Totais: 1.0 CPU | 350 MB
+volumes:
+  qdrant_storage:
+
+# Totais padrão (hnswflat): 1.0 CPU | 350 MB
+# Totais com --profile qdrant: 1.0 CPU | 350 MB
